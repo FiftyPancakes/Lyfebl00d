@@ -1,0 +1,85 @@
+{
+  "ethereum": {
+    "rpc_url": "https://ethereum-mainnet.core.chainstack.com/8289696ba41f04594614780bac26a4ef",
+    "factories": [
+      { "address": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f", "protocol_type": "UniswapV2", "dex_name": "Uniswap", "creation_block": 10000835 },
+      { "address": "0x1F98431c8aD98523631AE4a59f267346ea31F984", "protocol_type": "UniswapV3", "dex_name": "Uniswap", "creation_block": 12369621 },
+      { "address": "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac", "protocol_type": "SushiSwap", "dex_name": "SushiSwap", "creation_block": 10794229 },
+      { "address": "0x9424B1412450D0f8Fc2255FAf6046b98213B76Bd", "protocol_type": "BalancerV1", "dex_name": "Balancer", "creation_block": 10087235 },
+      { "address": "0xba100000625a3754423978a60c9317c58a424e3d", "protocol_type": "BalancerV2", "dex_name": "Balancer", "creation_block": 12272146 },
+      { "address": "0xD533a949740bb3306d119CC777fa900bA034cd52", "protocol_type": "Curve", "dex_name": "Curve", "creation_block": 9789122 }
+    ]
+  },
+  "polygon": {
+    "rpc_url": "https://polygon-mainnet.core.chainstack.com/a6120cd71d30865a12b4075ac2774c7d",
+    "factories": [
+      { "address": "0x1F98431c8aD98523631AE4a59f267346ea31F984", "protocol_type": "UniswapV3", "dex_name": "Uniswap", "creation_block": 22757763 },
+      { "address": "0x5757371414417b8C6CAad45bAeF941aBc7d3Ab32", "protocol_type": "QuickSwap", "dex_name": "QuickSwap", "creation_block": 15211425 },
+      { "address": "0xc35DADB65012eC5796536bD9864eD8773aBc74C4", "protocol_type": "SushiSwap", "dex_name": "SushiSwap", "creation_block": 15720935 },
+      { "address": "0xba100000625a3754423978a60c9317c58a424e3d", "protocol_type": "BalancerV2", "dex_name": "Balancer", "creation_block": 19618688 },
+      { "address": "0xD533a949740bb3306d119CC777fa900bA034cd52", "protocol_type": "Curve", "dex_name": "Curve", "creation_block": 16500000 }
+    ]
+  },
+  "arbitrum": {
+    "rpc_url": "https://arbitrum-mainnet.core.chainstack.com/f60271f6ab7c9a199de3c995a2f0e071",
+    "factories": [
+      { "address": "0x1F98431c8aD98523631AE4a59f267346ea31F984", "protocol_type": "UniswapV3", "dex_name": "Uniswap", "creation_block": 11063496 },
+      { "address": "0xc35DADB65012eC5796536bD9864eD8773aBc74C4", "protocol_type": "SushiSwap", "dex_name": "SushiSwap", "creation_block": 222078 },
+      { "address": "0xba100000625a3754423978a60c9317c58a424e3d", "protocol_type": "BalancerV2", "dex_name": "Balancer", "creation_block": 222078 },
+      { "address": "0xD533a949740bb3306d119CC777fa900bA034cd52", "protocol_type": "Curve", "dex_name": "Curve", "creation_block": 222078 }
+    ]
+  },
+  "avalanche": {
+    "rpc_url": "https://avalanche-mainnet.core.chainstack.com/ext/bc/C/rpc/561f44b6fad1537179f7d45abe59eb47",
+    "factories": [
+      { "address": "0x1F98431c8aD98523631AE4a59f267346ea31F984", "protocol_type": "UniswapV3", "dex_name": "Uniswap", "creation_block": 11907934 },
+      { "address": "0xc35DADB65012eC5796536bD9864eD8773aBc74C4", "protocol_type": "SushiSwap", "dex_name": "SushiSwap", "creation_block": 506425 },
+      { "address": "0x2D99ABD9008Dc933ff5c0CD271B88309593aB921", "protocol_type": "Pangolin", "dex_name": "Pangolin", "creation_block": 2740 },
+      { "address": "0xba100000625a3754423978a60c9317c58a424e3d", "protocol_type": "BalancerV2", "dex_name": "Balancer", "creation_block": 11907934 },
+      { "address": "0xD533a949740bb3306d119CC777fa900bA034cd52", "protocol_type": "Curve", "dex_name": "Curve", "creation_block": 11907934 }
+    ]
+  },
+  "base": {
+    "rpc_url": "https://base-mainnet.core.chainstack.com/417bb475bd5164ae76a95717d94df8a4",
+    "factories": [
+      { "address": "0x1F98431c8aD98523631AE4a59f267346ea31F984", "protocol_type": "UniswapV3", "dex_name": "Uniswap", "creation_block": 5022 },
+      { "address": "0xc35DADB65012eC5796536bD9864eD8773aBc74C4", "protocol_type": "SushiSwap", "dex_name": "SushiSwap", "creation_block": 5022 },
+      { "address": "0xba100000625a3754423978a60c9317c58a424e3d", "protocol_type": "BalancerV2", "dex_name": "Balancer", "creation_block": 5022 },
+      { "address": "0xD533a949740bb3306d119CC777fa900bA034cd52", "protocol_type": "Curve", "dex_name": "Curve", "creation_block": 5022 }
+    ]
+  },
+  "bsc": {
+    "rpc_url": "https://bsc-mainnet.core.chainstack.com/463dc5c700f25db6739f9843a18e2490",
+    "factories": [
+      { "address": "0xBCfCcbde45cE874adCB698cC183deBcF17952812", "protocol_type": "PancakeSwapV2", "dex_name": "PancakeSwap", "creation_block": 5300000 },
+      { "address": "0x1F98431c8aD98523631AE4a59f267346ea31F984", "protocol_type": "UniswapV3", "dex_name": "Uniswap", "creation_block": 27282000 },
+      { "address": "0xc35DADB65012eC5796536bD9864eD8773aBc74C4", "protocol_type": "SushiSwap", "dex_name": "SushiSwap", "creation_block": 15921452 },
+      { "address": "0xba100000625a3754423978a60c9317c58a424e3d", "protocol_type": "BalancerV2", "dex_name": "Balancer", "creation_block": 15921452 },
+      { "address": "0xD533a949740bb3306d119CC777fa900bA034cd52", "protocol_type": "Curve", "dex_name": "Curve", "creation_block": 15921452 }
+    ]
+  },
+  "gnosis": {
+    "rpc_url": "https://nd-975-279-273.p2pify.com/4f7dcc38266a844108807ffe414aae89",
+    "factories": [
+      { "address": "0x1F98431c8aD98523631AE4a59f267346ea31F984", "protocol_type": "UniswapV3", "dex_name": "Uniswap", "creation_block": 21022491 },
+      { "address": "0xba100000625a3754423978a60c9317c58a424e3d", "protocol_type": "BalancerV2", "dex_name": "Balancer", "creation_block": 21022491 },
+      { "address": "0xD533a949740bb3306d119CC777fa900bA034cd52", "protocol_type": "Curve", "dex_name": "Curve", "creation_block": 21022491 }
+    ]
+  },
+  "optimism": {
+    "rpc_url": "https://optimism-mainnet.core.chainstack.com/b323f7d4bc3d55d8ec08a0edc8919bd9",
+    "factories": [
+      { "address": "0x1F98431c8aD98523631AE4a59f267346ea31F984", "protocol_type": "UniswapV3", "dex_name": "Uniswap", "creation_block": 105235063 },
+      { "address": "0xba100000625a3754423978a60c9317c58a424e3d", "protocol_type": "BalancerV2", "dex_name": "Balancer", "creation_block": 105235063 },
+      { "address": "0xD533a949740bb3306d119CC777fa900bA034cd52", "protocol_type": "Curve", "dex_name": "Curve", "creation_block": 105235063 }
+    ]
+  },
+  "ronin": {
+    "rpc_url": "https://ronin-mainnet.core.chainstack.com/6840ab58f1031a42b662de4985e4d955",
+    "factories": []
+  },
+  "solana": {
+    "rpc_url": "https://api.mainnet-beta.solana.com",
+    "factories": []
+  }
+}

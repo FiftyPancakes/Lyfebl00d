@@ -1,0 +1,64 @@
+{
+  "aggregator": {
+    "one_inch_api_url": "https://api.1inch.dev/swap/v6.0",
+    "oneinch_api_key": "gARnqgXkBbia1meO8bov7ORBI3A7UysB",
+    "timeout_secs": 10
+  },
+  "redis": {
+    "redis_host": "127.0.0.1",
+    "redis_port": 6379
+  },
+  "infura": {
+    "infura_gas_api_url": "https://gas.api.infura.io/v3",
+    "infura_api_key": "5faeb4d455a04079a68620988d867d69"
+  },
+  "chainlink": {
+    "price_feeds": {
+      "eth_usd": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+      "btc_usd": "0xf4030086522a5beea4988f8ca5b36dbc97bee88c",
+      "link_usd": "0x2c1d072e956AFFC0D435Cb7AC38EF18d24d9127c",
+      "uni_usd": "0x553303d460104b45f1dea4a2d517812271f22477",
+      "aave_usd": "0x547a514d5e3769680ce22b2361c10ea13619e8a9",
+      "mkr_usd": "0xec1d1b3b0443256cc3860e24a46f108e699484aa",
+      "comp_usd": "0xdbd020caef83efd542f4de03e3cf0c28a4428bd5",
+      "snx_usd": "0xe23d1142de4e83c08bb048bcab54d50907390828",
+      "sushi_usd": "0xe572cef69f43c2e488b33924af04bdacbc8ac06d",
+      "crv_usd": "0xcd627aa160a6fa45eb793d19ef54f5062f20f33a",
+      "yfi_usd": "0x7c5d4f8345e66f68099581db340cd65b078c41f4",
+      "bal_usd": "0x0e4fcec26c9f85c3d714370c98f43c4e02fc35ae",
+      "bat_usd": "0x0d16d4528239e9ee52fa531af613acdb23d88c94",
+      "zrx_usd": "0x2885d15b8af22648b98b122b22fdf4d2a56c6023",
+      "mana_usd": "0x3a7e6117f2979efecb0188827b9b61dfd63eae96",
+      "enj_usd": "0x24d9c6b3a0d2e3e6c1e7e2e6e3e3e3e3e3e3e3e3",
+      "chz_usd": "0x0f9e4d49f25de22c2202af916b681fbb3790497b",
+      "busd_usd": "0x614715d2af89e6ec99a233818275142cE88A45F4",
+      "usdc_usd": "0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6",
+      "usdt_usd": "0x3E7d1eAB13ad0104d2750B8863b489D65364e32D",
+      "dai_usd": "0xAed0c38402a5d19df6E4c03F4E2DceD6e29c1ee9",
+      "wbtc_usd": "0xFD858c8bC5ac5e10f01018bC78471bb0DC392247",
+      "weth_usd": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+      "1inch_usd": "0xc929ad75b72593967de83e7f7cda0493458261d9",
+      "axs_usd": "0x8b7e6c7c9b3b1b3b1b3b1b3b1b3b1b3b1b3b1b3b",
+      "sand_usd": "0x3e9e5c9b573c05e7e3e3e3e3e3e3e3e3e3e3e3e3",
+      "shib_usd": "0xEe9F2375b4bdF6387aa8265dD4FB8F16512A1d46",
+      "doge_usd": "0x7b2b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b",
+      "matic_usd": "0xab594600376ec9fd91f8e885dadf0ce036862de0",
+      "avax_usd": "0x0A77230d17318075983913bC2145DB16C7366156",
+      "ftm_usd": "0x2DE7E4a9488488e0058B95854CC2f7955B35dC9b",
+      "uni_eth": "0x553303d460104b45f1dea4a2d517812271f22477"
+    },
+    "token_feeds": {
+      "1": {
+        "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48": "0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6",
+        "0xdAC17F958D2ee523a2206206994597C13D831ec7": "0x3E7d1eAB13ad0104d2750B8863b489D65364e32D",
+        "0x6B175474E89094C44Da98b954EedeAC495271d0F": "0xAed0c38402a5d19df6E4c03F4E2DceD6e29c1ee9",
+        "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599": "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c",
+        "0x514910771AF9Ca656af840dff83E8264EcF986CA": "0x2c1d072e956AFFC0D435Cb7AC38EF18d24d9127c"
+      }
+    }
+  },
+  "chainbase": {
+    "api_key": "2y16xFytWiHosxB2pAfZ6iJpi5N"
+  }
+} 

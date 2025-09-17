@@ -1,0 +1,11 @@
+{
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.2.0",
+    "dotenv": "^16.4.7",
+    "p-queue": "^8.1.0",
+    "pg": "^8.14.1",
+    "solc": "^0.8.29",
+    "web3": "^4.16.0",
+    "winston": "^3.17.0"
+  }
+}

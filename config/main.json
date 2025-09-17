@@ -1,0 +1,7 @@
+{
+  "mode": "PaperTrading",
+  "database_url": "postgres://ichevako:maddie@localhost:5432/lyfeblood",
+  "log_level": "debug",
+  "max_connections": 10,
+  "connection_timeout_secs": 30
+}

@@ -1,0 +1,10 @@
+{
+  "uniswap_v2": 120000,
+  "uniswap_v3": 150000,
+  "uniswap_v4": 180000,
+  "sushiswap": 120000,
+  "pancakeswap": 120000,
+  "curve": 200000,
+  "balancer": 250000,
+  "other": 150000
+} 

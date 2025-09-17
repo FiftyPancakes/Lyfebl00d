@@ -1,0 +1,23 @@
+[profile.default]
+src = 'contracts'
+test = 'test'
+libs = ['lib']
+out = 'out'
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+
+# Include mock contracts from contracts directory
+fs_permissions = [{ access = "read-write", path = "./" }]
+include_paths = ["contracts"]
+
+# Remappings for OpenZeppelin contracts
+remappings = [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+    "forge-std/=lib/forge-std/src/",
+    "aave-v3-core/=lib/aave-v3-core/contracts/",
+    "chainlink/=lib/chainlink/contracts/",
+    "v3-core/=lib/v3-core/contracts/",
+    "@openzeppelin/contracts/utils/math/SafeMath.sol=contracts/utils/SafeMath.sol",
+]

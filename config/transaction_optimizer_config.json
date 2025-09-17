@@ -1,0 +1,21 @@
+{
+  "base_fee_buffer": 1.1,
+  "error_backoff_max_ms": 10000,
+  "error_backoff_min_ms": 500,
+  "flashbots_block_offset": 1,
+  "flashbots_endpoint": "https://relay.flashbots.net",
+  "flashbots_signing_key": null,
+  "gas_buffer": 1.2,
+  "gas_estimation_blocks": 10,
+  "gas_percentile": 75.0,
+  "max_gas_price_gwei": 1000,
+  "max_retry_attempts": 3,
+  "min_priority_fee": "1500000000",
+  "private_key": "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+  "retry_delay_ms": 1000,
+  "sandwich_tolerance": 0.1,
+  "transaction_timeout_secs": 120,
+  "use_flashbots": false,
+  "cancel_gas_multiplier": 1.1,
+  "replace_gas_multiplier": 1.1
+} 

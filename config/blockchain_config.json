@@ -1,0 +1,16 @@
+{
+  "chain_settings": {
+    "default_connection_timeout_secs": 30,
+    "default_health_check_interval_secs": 30,
+    "default_max_retries": 5,
+    "default_reconnect_attempts": 5,
+    "default_debug_rpc_url": null
+  },
+  "log_addr_batch": 1000,
+  "token_price_cache_ttl": 7200,
+  "batch_size": 30,
+  "coverage_ratio_threshold": 0.95,
+  "max_retry_attempts": 5,
+  "abi_min_length": 68,
+  "abi_length_offset": 68
+} 

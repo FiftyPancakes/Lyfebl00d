@@ -1,0 +1,215 @@
+{
+  "arb_currency_address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+  "enabled": true,
+  "strict_backtest": true,
+  "random_seed": 12345,
+  "max_parallel_blocks": 4,
+  "rps_limit": 25.0,
+  "concurrent_limit": 50,
+  "burst_allowance": 10,
+  "rate_limit_initial_backoff_ms": 100,
+  "rate_limit_max_backoff_ms": 5000,
+  "rate_limit_backoff_multiplier": 1.5,
+  "rate_limit_jitter_factor": 0.1,
+  "rate_limit_max_retries": 3,
+  "rate_limit_timeout_secs": 30,
+  "batch_size": 100,
+  "min_batch_delay_ms": 10,
+  "database": {
+    "host": "localhost",
+    "port": 5432,
+    "user": "ichevako",
+    "password": "maddie",
+    "dbname": "lyfeblood",
+    "connect_timeout_secs": 10,
+    "pool_max_size": 10
+  },
+  "chains": {
+
+    "ethereum": {
+      "enabled": true,
+      "backtest_archival_rpc_url": "https://ethereum-mainnet.core.chainstack.com/8289696ba41f04594614780bac26a4ef",
+      "backtest_start_block": 23026000,
+      "backtest_end_block": 23026005,
+      "backtest_result_output_file": "./backtest_results.ethereum.json",
+      "pool_discovery_threshold": 0.1,
+      "backtest_use_external_price_apis": true
+    },
+    "polygon": {
+      "enabled": false,
+      "backtest_archival_rpc_url": "https://polygon-mainnet.core.chainstack.com/a6120cd71d30865a12b4075ac2774c7d",
+      "backtest_start_block": 74533000,
+      "backtest_end_block": 74543000,
+      "backtest_result_output_file": "./backtest_results.polygon.json",
+      "pool_discovery_threshold": 0.01
+    },
+    "arbitrum": {
+      "enabled": false,
+      "backtest_archival_rpc_url": "https://arbitrum-mainnet.core.chainstack.com/f60271f6ab7c9a199de3c995a2f0e071",
+      "backtest_start_block": 362620000,
+      "backtest_end_block": 362630000,
+      "backtest_result_output_file": "./backtest_results.arbitrum.json",
+      "pool_discovery_threshold": 0.01
+    },
+    "avalanche": {
+      "enabled": false,
+      "backtest_archival_rpc_url": "https://avalanche-mainnet.core.chainstack.com/ext/bc/C/rpc/561f44b6fad1537179f7d45abe59eb47",
+      "backtest_start_block": 66219000,
+      "backtest_end_block": 66219947,
+      "backtest_result_output_file": "./backtest_results.avalanche.json",
+      "pool_discovery_threshold": 0.01
+    },
+    "base": {
+      "enabled": false,
+      "backtest_archival_rpc_url": "https://base-mainnet.core.chainstack.com/417bb475bd5164ae76a95717d94df8a4",
+      "backtest_start_block": 33479000,
+      "backtest_end_block": 33480051,
+      "backtest_result_output_file": "./backtest_results.base.json",
+      "pool_discovery_threshold": 0.01
+    },
+    "bsc": {
+      "enabled": false,
+      "backtest_archival_rpc_url": "https://bsc-mainnet.core.chainstack.com/463dc5c700f25db6739f9843a18e2490",
+      "backtest_start_block": 55668000,
+      "backtest_end_block": 55668628,
+      "backtest_result_output_file": "./backtest_results.bsc.json",
+      "pool_discovery_threshold": 0.01
+    },
+    "gnosis": {
+      "enabled": false,
+      "backtest_archival_rpc_url": "https://nd-975-279-273.p2pify.com/4f7dcc38266a844108807ffe414aae89",
+      "backtest_start_block": 33479000,
+      "backtest_end_block": 33480000,
+      "backtest_result_output_file": "./backtest_results.gnosis.json",
+      "pool_discovery_threshold": 0.01
+    },
+    "optimism": {
+      "enabled": false,
+      "backtest_archival_rpc_url": "https://optimism-mainnet.core.chainstack.com/b323f7d4bc3d55d8ec08a0edc8919bd9",
+      "backtest_start_block": 139070000,
+      "backtest_end_block": 139071000,
+      "backtest_result_output_file": "./backtest_results.optimism.json",
+      "pool_discovery_threshold": 0.01
+    },
+    "ronin": {
+      "enabled": false,
+      "backtest_archival_rpc_url": "https://ronin-mainnet.core.chainstack.com/6840ab58f1031a42b662de4985e4d955",
+      "backtest_start_block": 26990000,
+      "backtest_end_block": 27000000,
+      "backtest_result_output_file": "./backtest_results.ronin.json",
+      "pool_discovery_threshold": 0.01
+    },
+    "solana": {
+      "enabled": false,
+      "backtest_archival_rpc_url": "https://api.mainnet-beta.solana.com",
+      "backtest_start_block": 229900000,
+      "backtest_end_block": 230000000,
+      "backtest_result_output_file": "./backtest_results.solana.json",
+      "pool_discovery_threshold": 0.01
+    }
+  },
+  "min_liquidity_usd": 1000.0,
+  "log_level": "INFO",
+  "output_format": "json",
+  "progress_interval": 100,
+  "save_interval": 1000,
+  "write_json_per_block": false,
+  "max_parallel_chains": 4,
+  "parallel_execution": false,
+  "simulate_competition": true,
+  "simulate_gas_dynamics": true,
+  "simulate_mev_attacks": true,
+  "use_flashloans": true,
+  "enable_cross_chain_arbitrage": false,
+  "cross_chain_min_profit_usd": 5.0,
+  "data_source": {
+    "type": "Database",
+    "connection_string": "postgresql://ichevako:maddie@localhost:5432/lyfeblood"
+  },
+  "pool_data_cache_dir": "cache/pool_data",
+  "dexes": {
+    "uniswap_v2": {
+      "enabled": true,
+      "pairs": "all"
+    },
+    "uniswap_v3": {
+      "enabled": true,
+      "pairs": "all"
+    },
+    "sushiswap": {
+      "enabled": true,
+      "pairs": "all"
+    },
+    "curve": {
+      "enabled": true,
+      "pairs": "all"
+    },
+    "balancer": {
+      "enabled": true,
+      "pairs": "all"
+    }
+  },
+  "token_batch_size": 100,
+  "mempool_analysis_depth": 100,
+  "monte_carlo_iterations": 1000,
+  "perf_analysis_interval": 100,
+  "address_filters": [],
+  "pool_creation_block_filtering": true,
+  "rate_limiter_settings": {
+    "global_rps_limit": 200,
+    "default_chain_rps_limit": 25
+  },
+  
+  "comment_simulation_settings": "New configurable simulation parameters for advanced backtesting scenarios",
+  
+  "competition_bot_count": 50,
+  "competition_skill_range": [0.3, 0.9],
+  "competition_latency_range_ms": [50, 500],
+  
+  "mev_attack_probability": 0.1,
+  "mev_sandwich_success_rate": 0.7,
+  "mev_frontrun_success_rate": 0.5,
+  "mev_avg_profit_loss_usd": 50.0,
+  
+  "hot_tokens_search_enabled": true,
+  "hot_tokens_search_interval_blocks": 100,
+  "hot_tokens": [
+    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+    "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+    "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984",
+    "0x514910771AF9Ca656af840dff83E8264EcF986CA",
+    "0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e"
+  ],
+  
+  "proactive_scanning_enabled": true,
+  "max_tokens_per_block_scan": 10,
+  "max_opportunities_per_block": 5,
+  "scan_amounts": [
+    "10000000000000000000",
+    "50000000000000000000", 
+    "100000000000000000000"
+  ],
+  "_comment_scenario_presets": "Example configurations for different market scenarios",
+  "_scenario_low_competition": {
+    "competition_bot_count": 10,
+    "competition_skill_range": [0.2, 0.6],
+    "competition_latency_range_ms": [100, 800],
+    "mev_attack_probability": 0.05
+  },
+  "_scenario_high_mev": {
+    "competition_bot_count": 100,
+    "competition_skill_range": [0.5, 0.95],
+    "competition_latency_range_ms": [20, 200],
+    "mev_attack_probability": 0.25,
+    "mev_sandwich_success_rate": 0.85,
+    "mev_avg_profit_loss_usd": 100.0
+  },
+  "_scenario_bull_market": {
+    "hot_tokens_search_interval_blocks": 50,
+    "mev_attack_probability": 0.15,
+    "competition_bot_count": 75
+  }
+}

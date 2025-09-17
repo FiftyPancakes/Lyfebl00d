@@ -1,0 +1,98 @@
+name: E2E Integration Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+env:
+  RUST_LOG: info
+  CARGO_TERM_COLOR: always
+  MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+  FORK_BLOCK_NUMBER: 19000000
+
+jobs:
+  e2e-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Foundry
+      uses: foundry-rs/foundry-toolchain@v1
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+
+    - name: Install dependencies
+      run: npm install
+
+    - name: Setup Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Build project
+      run: cargo build --release
+
+    - name: Start Anvil fork
+      run: |
+        anvil --fork-url $MAINNET_RPC_URL --fork-block-number $FORK_BLOCK_NUMBER --port 8545 &
+        sleep 10
+
+    - name: Run E2E integration tests
+      run: |
+        cargo test -F e2e -- --nocapture --test-threads=1 test_comprehensive_end_to_end_arbitrage_flow
+      env:
+        RPC_URL: http://localhost:8545
+
+    - name: Run deterministic ABI encoding test
+      run: |
+        cargo test -F e2e -- --nocapture test_deterministic_integration_with_real_abi_encoding
+      env:
+        RPC_URL: http://localhost:8545
+
+    - name: Run slippage protection test
+      run: |
+        cargo test -F e2e -- --nocapture test_slippage_protection_and_revert_handling
+      env:
+        RPC_URL: http://localhost:8545
+
+    - name: Run concurrent execution test
+      run: |
+        cargo test -F e2e -- --nocapture test_concurrent_trade_execution_and_nonce_management
+      env:
+        RPC_URL: http://localhost:8545
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: e2e-test-results
+        path: |
+          paper_trade.log
+          target/debug/deps/test_integration-*
+
+  cleanup:
+    runs-on: ubuntu-latest
+    if: always()
+    needs: e2e-tests
+
+    steps:
+    - name: Cleanup
+      run: echo "E2E tests completed"

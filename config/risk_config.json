@@ -1,0 +1,16 @@
+{
+  "anomaly_threshold": 3.0,
+  "cooldown_period_sec": 600,
+  "flash_loan_risk_factor": 0.0,
+  "max_exposure_usd": 1000.0,
+  "max_fail_count": 3,
+  "max_pool_risk_score": 20,
+  "max_risk_score": 1.0,
+  "max_slippage_bps": 10000,
+  "max_token_risk_score": 20,
+  "max_volatility": 0.1,
+  "mev_tolerance": 1.0,
+  "min_liquidity_usd": 1.0,
+  "min_token_market_cap_usd": 1,
+  "simulation_timeout_secs": 5
+} 

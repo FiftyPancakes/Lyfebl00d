@@ -1,0 +1,50 @@
+   Compiling system-configuration-sys v0.6.0
+   Compiling atomic-waker v1.1.2
+   Compiling reqwest v0.11.27
+   Compiling h2 v0.4.12
+   Compiling system-configuration v0.6.1
+   Compiling ethers-providers v2.0.14
+   Compiling ethers-etherscan v2.0.14
+   Compiling web3 v0.19.0
+   Compiling influxdb v0.7.2
+   Compiling hyper v1.6.0
+   Compiling hyper-util v0.1.15
+   Compiling hyper-rustls v0.27.7
+   Compiling hyper-tls v0.6.0
+   Compiling axum v0.7.9
+   Compiling reqwest v0.12.22
+   Compiling solana-metrics v2.3.4
+   Compiling reqwest-middleware v0.4.2
+   Compiling solana-rpc-client-api v2.3.4
+   Compiling solana-connection-cache v2.3.4
+   Compiling solana-perf v2.3.4
+   Compiling solana-rpc-client v2.3.4
+   Compiling solana-transaction-metrics-tracker v2.3.4
+   Compiling anvil v0.1.1
+   Compiling solana-streamer v2.3.4
+   Compiling solana-quic-client v2.3.4
+   Compiling solana-udp-client v2.3.4
+   Compiling ethers-contract v2.0.14
+   Compiling solana-tpu-client v2.3.4
+   Compiling solana-rpc-client-nonce-utils v2.3.4
+   Compiling solana-thin-client v2.3.4
+   Compiling solana-client v2.3.4
+   Compiling ethers-middleware v2.0.14
+   Compiling ethers v2.0.14
+   Compiling ethers-flashbots v0.15.0 (https://github.com/onbjerg/ethers-flashbots?branch=master#64a0ac98)
+   Compiling rust v0.1.0 (/Users/ichevako/Desktop/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 14s
+warning: the following packages contain code that will be rejected by a future version of Rust: redis v0.23.3, sqlx-postgres v0.7.4
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 3`
+     Running `target/debug/mev_bot --config config/`
+2025-09-17T02:08:28.121545Z  INFO mev_bot: Starting MEV Bot with MEVEngine and AlphaEngine as central orchestrators
+2025-09-17T02:08:28.126328Z  INFO mev_bot: Configuration loaded successfully
+2025-09-17T02:08:28.326587Z  INFO rust::rate_limiter: Initialized global rate limiter manager with a shared global limit. global_rps_limit=200
+2025-09-17T02:08:28.326954Z  INFO mev_bot: Global rate limiter manager initialized successfully
+2025-09-17T02:08:28.326960Z  INFO mev_bot: Starting in PAPER TRADING mode
+2025-09-17T02:08:28.332500Z  INFO mev_bot: Skipping chain optimism as it's not enabled for live trading
+2025-09-17T02:08:28.332511Z  INFO mev_bot: Skipping chain anvil as it's not enabled for live trading
+2025-09-17T02:08:28.332513Z  INFO mev_bot: Skipping chain avalanche as it's not enabled for live trading
+2025-09-17T02:08:28.332516Z  INFO mev_bot: Skipping chain gnosis as it's not enabled for live trading
+2025-09-17T02:08:28.333903Z  INFO throughput_monitor: Global event channel throughput global_event_channel_subscribers=1 channel_capacity=32768 events_per_sec=0.0
+Error: Database(Config("Failed to get shared sqlx pool: Risk check failed: Failed to verify swaps table: error returned from database: relation \"swaps\" does not exist"))

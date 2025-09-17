@@ -1,0 +1,10 @@
+requests
+aiohttp
+aiofiles
+web3
+eth-abi
+eth-utils
+eth-typing
+z3-solver
+numpy
+PyYAML 

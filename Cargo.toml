@@ -1,0 +1,279 @@
+[package]
+name = "rust"
+version = "0.1.0"
+edition = "2021"
+description = "DeFi market data and analytics engine"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT"
+# default-run = "defi-arbitrage"
+
+# Add lib section to configure test behavior
+[lib]
+name = "rust"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+# Async Runtime and Features
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+futures-util = "0.3.28"
+bigdecimal = "0.4"
+async-trait = "0.1"
+async-recursion = "1.0.0"
+num-bigint = "0.4"
+deadpool-postgres = "0.10"
+redis = { version = "0.23", features = ["tokio-comp"] }
+moka = { version = "0.12", features = ["future"] } 
+rayon = "1.7"
+lazy_static = "1.4"
+once_cell = "1.18"
+sha3 = "0.10"
+tch = { version = "=0.13.0", features = ["download-libtorch"] }
+downcast-rs = "1.2"
+base64 = "0.21"
+base64ct = "1.6.0"
+warp = "0.3"
+solana-client = "2.2.7"
+solana-sdk = "2.2.2"
+solana-streamer = "2.2.2"
+hex-literal = "0.4"
+tracing-appender = "0.2"
+arrayref = "0.3"
+
+# Additional Dependencies
+rand_distr = "0.4"
+nanoid = "0.4"
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres"] }
+tracing-futures = "0.2"
+metrics = "0.21"
+metrics-exporter-prometheus = "0.12"
+lru = "0.12"
+ndarray = { version = "0.15.0", features = ["serde"] }
+ndarray-stats = "0.5"
+statrs = "0.16"
+web3 = "0.19"
+rust_decimal = { version = "1.33", features = ["serde-float", "serde", "db-tokio-postgres", "maths", "serde-with-str"] }
+mockito = "0.32.0"
+wiremock = "0.5"
+tokio-postgres = { version = "0.7", features = ["with-uuid-0_8"] }
+anvil = "0.1"
+thiserror = "1.0"
+
+# Ethereum / Web3 Dependencies
+itertools = "0.12"
+ethers = { version = "2.0.14", features = ["ws", "legacy", "openssl"], optional = true }
+ethers-flashbots = { git = "https://github.com/onbjerg/ethers-flashbots", branch = "master" }
+
+# Serialization
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+bincode = "1.3"
+serde_derive = "1.0"
+
+# Compression
+flate2 = "1.0"
+lz4_flex = "0.11"
+snap = "1.1"
+
+# Logging and Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4"
+env_logger = "0.10"
+
+# Configuration and Error Handling
+anyhow = "1.0"
+eyre = "0.6"
+color-eyre = "0.6"
+dotenvy = "0.15"
+dotenv = "0.15"
+clap = { version = "4.0", features = ["derive"] }
+
+# HTTP and WebSocket
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+url = "2.4"
+bb8 = "0.8"
+bb8-postgres = "0.8"
+
+# Memory Management
+zerocopy = { version = "0.7.35", features = ["derive"] }
+parking_lot = "0.12"
+
+# Cryptographic dependencies for secrets management
+aes-gcm = "0.10"
+argon2 = "0.5"
+md5 = "0.7"
+rpassword = "7.3"
+
+# Concurrency and Data Structures
+dashmap = "5.5"
+crossbeam-channel = "0.5"
+bitflags = "2.3"
+
+# Metrics
+prometheus = { version = "0.13.3", features = ["process"] }
+prost = "0.12.3"
+prost-types = "0.12.3"
+rand = { version = "0.8.5", features = ["std_rng"] }
+rand_chacha = "0.3.1"
+regex = "1.10.3"
+serial_test = "2.0.0"
+shellexpand = "3.1.0"
+
+# Time and Date
+chrono = { version = "0.4", features = ["serde", "clock"] }
+
+# Utilities
+hex = "0.4"
+derivative = "2.2"
+num_cpus = "1.15"
+fnv = "1.0.7"
+sha2 = "0.10"
+statistical = "1.0.0"
+tokio-tungstenite = { version = "0.19", features = ["native-tls"] }
+socket2 = "0.5"
+walkdir = "2.4.0"
+num = "0.4"
+uuid = { version = "1.5", features = ["v4", "serde"] }
+zeroize = { version = "1.4.3", features = ["zeroize_derive"] }
+
+# Add flashbots-ethers-provider dependency
+# flashbots-ethers-provider = "0.1.0"
+
+# New dependency
+governor = { version = "0.6", features = ["std", "jitter"] }
+
+# Added from the code block
+arc-swap = "1.7"
+smallvec = { version = "1.11", features = ["serde"] }
+
+# Added from the code block
+fastrand = "2.0"
+ahash = "0.8"
+bytes = "1.5"
+
+# Added from the code block
+bit-vec = "0.6"
+petgraph = "0.6"
+priority-queue = "1.3"
+
+# Added from the code block
+tokio-util = { version = "0.7" }
+
+# Missing dependencies
+crossbeam-skiplist = "0.1"
+phf = { version = "0.11", features = ["macros"] }
+crossbeam = "0.8"
+crossbeam-deque = "0.8"
+memmap2 = "0.5"
+nonzero_ext = "0.3"
+blake3 = "1.5"
+ordered-float = { version = "4.1", features = ["serde"] }
+derive_more = "0.99"
+strum = { version = "0.25", features = ["derive"] }
+
+nalgebra = "0.32"
+smartcore = { version = "0.2.0", default-features = false, features = ["nalgebra-bindings"] }
+ta = "0.5.0"
+argmin = { version = "0.8.1", features = ["slog-logger"] }
+argmin-math = { version = "0.1.0", features = ["nalgebra_latest"] }
+tract-onnx = { version = "0.21.13", optional = true }
+tract-core = { version = "0.21.13", optional = true }
+influxdb = { version = "0.7.1", features = ["derive"] }
+
+# Added from the code block
+num-traits = "0.2"
+
+# Winnow parser combinator library
+winnow = "0.5"
+ethers-solc = "2.0.14"
+scopeguard = "1.2.0"
+rust_decimal_macros = "1.37.1"
+sysinfo = "0.36.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+proptest = "1.2"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.7"
+mockall = "0.11.0"
+tracing-test = "0.2"
+serial_test = "3.2.0"
+assert_matches = "1.5"
+fake = "4.3.0"
+regex = "1.0"
+testcontainers = { version = "0.15", features = ["experimental"] }
+testcontainers-modules = { version = "0.3", features = ["postgres"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = 'unwind'
+debug = true
+strip = false
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[workspace]
+members = ["."]
+
+[features]
+onnx = ["tract-onnx", "tract-core"]
+ethereum = ["ethers"]
+live = ["ethereum"]
+backtest = []
+benchmarks = []
+e2e = ["ethereum"]
+experimental = []
+default = ["ethereum"]
+
+# Ensure only one execution mode is enabled
+
+[[bin]]
+name = "coins"
+path = "src/bin/coins.rs"
+
+[[bin]]
+name = "pools"
+path = "src/bin/cg_pools.rs"
+
+[[bin]]
+name = "dexes"
+path = "src/bin/dexes.rs"
+
+[[bin]]
+name = "data_scheduler"
+path = "src/bin/data_scheduler.rs"
+
+[[bin]]
+name = "prices"
+path = "src/bin/prices.rs"
+
+[[bin]]
+name = "swap"
+path = "src/bin/swap.rs"
+
+[[bin]]
+name = "trades"
+path = "src/bin/trades.rs"
+
+[[bin]]
+name = "discover"
+path = "src/bin/discover_pools.rs"
+
+[[bin]]
+name = "secrets_initializer"
+path = "src/secrets_initializer.rs"
+
+[[bin]]
+name = "mev_bot"
+path = "src/main.rs"
+
+[build-dependencies]
+ethers = { version = "2.0.14", features = ["abigen"] }
