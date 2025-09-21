@@ -1100,7 +1100,7 @@ impl BlockchainManager for BlockchainManagerImpl {
                         }
                     };
 
-                    match swap_loader.get_token_decimals_batch(tokens, block_number).await {
+                    match swap_loader.get_token_decimals_batch(&self.chain_name, tokens, block_number).await {
                         Ok(decimals) => {
                             // Convert Vec<u8> to Vec<Option<u8>> with all Some values
                             let result = decimals.into_iter().map(Some).collect();

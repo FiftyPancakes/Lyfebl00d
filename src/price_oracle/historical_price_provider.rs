@@ -532,7 +532,7 @@ impl HistoricalPriceProvider {
             || async {
                 let decimals_vec = self
                     .loader
-                    .get_token_decimals_batch(&[token], self.block_number)
+                    .get_token_decimals_batch(&self.chain_name, &[token], self.block_number)
                     .await
                     .map_err(|e| PriceError::DataSource(format!("Failed to get token decimals: {}", e)))?;
                 

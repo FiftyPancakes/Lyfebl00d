@@ -840,6 +840,12 @@ impl From<ethers::providers::ProviderError> for BlockchainError {
     }
 }
 
+impl From<ethers::contract::AbiError> for BlockchainError {
+    fn from(e: ethers::contract::AbiError) -> Self {
+        BlockchainError::DataEncoding(format!("ABI error: {}", e))
+    }
+}
+
 // Convert specific provider errors into our custom error types for better context.
 impl From<ethers::providers::ProviderError> for ListenerError {
     fn from(e: ethers::providers::ProviderError) -> Self {

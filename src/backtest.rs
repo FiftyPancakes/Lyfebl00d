@@ -30,6 +30,7 @@ use tokio::{
     fs,
     sync::{RwLock, Mutex},
 };
+use parking_lot::RwLock as SyncRwLock;
 use tracing::{info, debug, warn};
 use futures;
 
@@ -91,6 +92,8 @@ const RESULT_STREAM_FLUSH_THRESHOLD: usize = 10;
 const GRAPH_PRUNING_RETENTION_BLOCKS: u64 = 1000;
 // Default USD notionals for scan sizing when not provided via config
 const DEFAULT_SCAN_USD_NOTIONALS: [f64; 3] = [50.0, 200.0, 1000.0];
+// Max number of token pairs to scan per block for cross-DEX strategy
+const DEFAULT_MAX_PAIRS_PER_BLOCK: usize = 1000;
 
 /// Bounded collection for opportunities to prevent unbounded memory growth
 #[derive(Debug, Clone)]
@@ -154,6 +157,7 @@ pub struct BacktestThresholds {
     pub max_opportunities_per_block: usize,
     pub max_tokens_per_scan: usize,
     pub scan_usd_amounts: Option<Vec<f64>>,
+    pub max_pairs_per_block: usize,
 }
 
 impl Default for BacktestThresholds {
@@ -165,6 +169,7 @@ impl Default for BacktestThresholds {
             max_opportunities_per_block: DEFAULT_MAX_OPPORTUNITIES_PER_BLOCK,
             max_tokens_per_scan: DEFAULT_MAX_TOKENS_PER_SCAN,
             scan_usd_amounts: Some(DEFAULT_SCAN_USD_NOTIONALS.to_vec()),
+            max_pairs_per_block: DEFAULT_MAX_PAIRS_PER_BLOCK,
         }
     }
 }
@@ -204,11 +209,13 @@ pub struct ResultStream {
 
 impl ResultStream {
     pub async fn new(output_path: std::path::PathBuf) -> Result<Self, BacktestError> {
+        // Write streaming results to a distinct NDJSON file to avoid clobbering the summary
+        let ndjson_path = output_path.with_extension("ndjson");
         let writer = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&output_path)
+            .open(&ndjson_path)
             .await
             .map_err(|e| BacktestError::IO(format!("Failed to open output file: {}", e)))?;
         
@@ -216,7 +223,7 @@ impl ResultStream {
             writer: Some(writer),
             buffer: Vec::with_capacity(RESULT_STREAM_FLUSH_THRESHOLD),
             flush_threshold: RESULT_STREAM_FLUSH_THRESHOLD,
-            output_path,
+            output_path: ndjson_path,
         })
     }
     
@@ -257,11 +264,7 @@ impl ResultStream {
     
     pub async fn finalize(mut self) -> Result<(), BacktestError> {
         self.flush().await?;
-        if let Some(mut writer) = self.writer.take() {
-            use tokio::io::AsyncWriteExt;
-            writer.shutdown().await
-                .map_err(|e| BacktestError::IO(format!("Failed to shutdown writer: {}", e)))?;
-        }
+        // Let the writer drop after flush; no explicit shutdown is required
         info!("Finalized result stream to: {:?}", self.output_path);
         Ok(())
     }
@@ -498,9 +501,20 @@ impl ProactiveScanStrategy {
         debug!(target: "backtest", "TOKEN_ANALYSIS: Tokens in graph but not candidates: {:?}", tokens_in_graph_not_candidates.collect::<Vec<_>>());
         debug!(target: "backtest", "TOKEN_ANALYSIS: Candidates not in graph: {:?}", candidates_not_in_graph.collect::<Vec<_>>());
 
-        // Price check for first few candidates
+        // Price check for first few candidates using block-aware pricing
+        let block_ts = infra
+            .blockchain_manager
+            .get_block(block.into())
+            .await
+            .ok()
+            .and_then(|opt| opt.map(|b| b.timestamp.as_u64()))
+            .unwrap_or(0);
         for (i, token) in token_candidates.iter().take(3).enumerate() {
-            if let Ok(price) = infra.price_oracle.get_token_price_usd(&infra.blockchain_manager.get_chain_name(), *token).await {
+            if let Ok(price) = infra
+                .price_oracle
+                .get_token_price_usd_at(&infra.blockchain_manager.get_chain_name(), *token, Some(block), Some(block_ts))
+                .await
+            {
                 debug!(target: "backtest", "PRICE_CHECK: Candidate {} ({:?}) = ${:.6}", i, token, price);
             } else {
                 debug!(target: "backtest", "PRICE_CHECK: Candidate {} ({:?}) = NO PRICE", i, token);
@@ -600,7 +614,7 @@ impl OpportunityDiscoveryStrategy for ProactiveScanStrategy {
               block, graph_snapshot.node_count(), graph_snapshot.edge_count(), token_candidates.len(), swap_tokens.len());
 
         // DEBUG: Log comprehensive state for troubleshooting
-        if log::log_enabled!(log::Level::Debug) {
+        if tracing::enabled!(tracing::Level::DEBUG) {
             self.log_comprehensive_debug_state(&infra, block, &token_candidates, &swap_tokens, &graph_snapshot).await;
         }
 
@@ -897,12 +911,13 @@ impl OpportunityDiscoveryStrategy for CrossDexStrategy {
 
         // Pairwise scan limited by thresholds
         let mut pair_count = 0usize;
+        let max_pairs_per_block = self.thresholds.max_pairs_per_block;
         for i in 0..tokens.len() {
             for j in (i + 1)..tokens.len() {
                 if opportunities.len() >= self.thresholds.max_opportunities_per_block {
                     break;
                 }
-                if pair_count >= self.thresholds.max_tokens_per_scan {
+                if pair_count >= max_pairs_per_block {
                     break;
                 }
                 pair_count += 1;
@@ -955,7 +970,7 @@ impl OpportunityDiscoveryStrategy for CrossDexStrategy {
                     Ok(price) if price > 0.0 => {
                         let maybe_decimals = self.infer_token_decimals_from_valid_pools(&valid_pools, token_a).await;
                         if let Some(d) = maybe_decimals {
-                            let normalized = (profit_wei.as_u128() as f64) / (10u128.pow(d as u32) as f64);
+                            let normalized = crate::types::normalize_units(profit_wei, d);
                             normalized * price
                         } else {
                             continue;
@@ -1012,10 +1027,10 @@ impl OpportunityDiscoveryStrategy for CrossDexStrategy {
                         pool_address: *pool,
                         token_in: tokens[0],
                         token_out: tokens[1],
-                        amount_in: enhanced_a.initial_amount_in_wei,
-                        min_amount_out: enhanced_a.min_output,
+                        amount_in: enhanced_a.legs.get(idx).map(|l| l.amount_in).unwrap_or(enhanced_a.initial_amount_in_wei),
+                        min_amount_out: enhanced_a.legs.get(idx).map(|l| l.amount_out).unwrap_or(enhanced_a.min_output),
                         fee_bps: enhanced_a.fee_path.get(idx).copied().unwrap_or(3000),
-                        expected_out: Some(enhanced_a.expected_output),
+                        expected_out: Some(enhanced_a.legs.get(idx).map(|l| l.amount_out).unwrap_or(enhanced_a.expected_output)),
                     })
                     .collect();
                 let mut legs_b: Vec<crate::types::ArbitrageRouteLeg> = enhanced_b
@@ -1033,10 +1048,10 @@ impl OpportunityDiscoveryStrategy for CrossDexStrategy {
                         pool_address: *pool,
                         token_in: tokens[0],
                         token_out: tokens[1],
-                        amount_in: enhanced_b.initial_amount_in_wei,
-                        min_amount_out: enhanced_b.min_output,
+                        amount_in: enhanced_b.legs.get(idx).map(|l| l.amount_in).unwrap_or(enhanced_b.initial_amount_in_wei),
+                        min_amount_out: enhanced_b.legs.get(idx).map(|l| l.amount_out).unwrap_or(enhanced_b.min_output),
                         fee_bps: enhanced_b.fee_path.get(idx).copied().unwrap_or(3000),
-                        expected_out: Some(enhanced_b.expected_output),
+                        expected_out: Some(enhanced_b.legs.get(idx).map(|l| l.amount_out).unwrap_or(enhanced_b.expected_output)),
                     })
                     .collect();
                 combined_legs.append(&mut legs_b);
@@ -1070,8 +1085,8 @@ impl OpportunityDiscoveryStrategy for CrossDexStrategy {
                     profit_token_amount: profit_wei,
                     profit_token: token_a,
                     estimated_gas_cost_wei: U256::from(enhanced_a.gas_estimate + enhanced_b.gas_estimate),
-                    risk_score: 0.0,
-                    mev_risk_score: 0.0,
+                    risk_score: 1.0 - ((enhanced_a.confidence_score + enhanced_b.confidence_score) / 2.0),
+                    mev_risk_score: 1.0 - ((enhanced_a.mev_resistance_score + enhanced_b.mev_resistance_score) / 2.0),
                     simulation_result: None,
                     metadata: Some(serde_json::json!({
                         "strategy": "cross_dex",
@@ -1334,8 +1349,8 @@ impl HotTokenStrategy {
                         .saturating_sub(path.initial_amount_in_wei),
                     profit_token: token_in,
                     estimated_gas_cost_wei: U256::from(path.gas_estimate),
-                    risk_score: 1.0 - path.confidence_score,
-                    mev_risk_score: 1.0 - path.mev_resistance_score,
+                    risk_score: (1.0 - path.confidence_score).min(1.0).max(0.0),
+                    mev_risk_score: (1.0 - path.mev_resistance_score).min(1.0).max(0.0),
                     simulation_result: None,
                     metadata: Some(metadata),
                     token_in,
@@ -1550,22 +1565,35 @@ impl ReactiveSwapStrategy {
     async fn analyze_swap_impact(
         &self,
         swap: &SwapEvent,
-        _infra: &Arc<ChainInfra>,
+        infra: &Arc<ChainInfra>,
         block: u64,
+        current_block_pool_states: &std::collections::HashMap<Address, crate::types::PoolInfo>,
     ) -> Result<Option<f64>, BacktestError> {
-        // Get pool state at the block before the swap
-        let chain_name = _infra.blockchain_manager.get_chain_name();
-        let pool_state = match _infra.pool_manager.get_pool_info(&chain_name, swap.pool_address, Some(block)).await {
-            Ok(pool_info) => pool_info,
-            Err(e) => {
-                debug!("Failed to get pool info for {}: {}, attempting to handle as first swap", swap.pool_address, e);
-                // This might be the first swap in the pool's history
-                // Try to reconstruct pre-swap state by reversing the swap math
-                return self.analyze_first_swap_impact(swap, _infra, block).await;
+        // Use intra-block pre-swap state if available; otherwise, load state from previous block
+        let chain_name = infra.blockchain_manager.get_chain_name();
+        let pool_state = if let Some(state) = current_block_pool_states.get(&swap.pool_address) {
+            state.clone()
+        } else {
+            match infra
+                .pool_manager
+                .get_pool_info(&chain_name, swap.pool_address, Some(block.saturating_sub(1)))
+                .await
+            {
+                Ok(pool_info) => pool_info,
+                Err(e) => {
+                    debug!(
+                        "Failed to get pre-swap pool info for {} at block {}: {}",
+                        swap.pool_address,
+                        block.saturating_sub(1),
+                        e
+                    );
+                    // As a last resort, attempt first-swap heuristic with correct decimals later
+                    return self.analyze_first_swap_impact(swap, infra, block).await;
+                }
             }
         };
 
-        // Compare actual output vs. expected output from pool math (same units → decimals cancel)
+        // Compare actual output vs. expected output from pool math using normalized units to avoid overflow
         let expected_out = match crate::dex_math::get_amount_out(&pool_state, swap.token_in, swap.amount_in) {
             Ok(v) => v,
             Err(e) => {
@@ -1576,13 +1604,16 @@ impl ReactiveSwapStrategy {
         if expected_out.is_zero() {
             return Ok(None);
         }
-        // impact % = |actual - expected| / expected * 100
-        let (act, exp) = (swap.amount_out, expected_out);
-        let impact = if exp > act {
-            (exp - act).as_u128() as f64 / exp.as_u128() as f64 * 100.0
+        // Normalize amounts using pool decimals
+        let out_dec: u8 = if swap.token_in == pool_state.token0 {
+            pool_state.token1_decimals
         } else {
-            (act - exp).as_u128() as f64 / exp.as_u128() as f64 * 100.0
+            pool_state.token0_decimals
         };
+        let expected_norm = crate::types::normalize_units(expected_out, out_dec);
+        let actual_norm = crate::types::normalize_units(swap.amount_out, out_dec);
+        if expected_norm == 0.0 { return Ok(None); }
+        let impact = ((actual_norm - expected_norm).abs() / expected_norm) * 100.0;
 
         // Only consider significant price impacts (0.5% threshold)
         if impact > 0.5 {
@@ -1604,19 +1635,28 @@ impl ReactiveSwapStrategy {
     async fn analyze_first_swap_impact(
         &self,
         swap: &SwapEvent,
-        _infra: &Arc<ChainInfra>,
+        infra: &Arc<ChainInfra>,
         block: u64,
     ) -> Result<Option<f64>, BacktestError> {
-        // For the first swap, we can't get pre-swap reserves, but we can estimate impact
-        // by assuming this was a significant event that could create arbitrage opportunities
+        // For the first swap, use actual pool decimals if obtainable; otherwise fallback conservatively
+        let chain_name = infra.blockchain_manager.get_chain_name();
+        let maybe_pool_info_prev = infra
+            .pool_manager
+            .get_pool_info(&chain_name, swap.pool_address, Some(block.saturating_sub(1)))
+            .await
+            .ok();
+        let (dec_in, dec_out) = if let Some(pool) = maybe_pool_info_prev {
+            let dec_in = if swap.token_in == pool.token0 { pool.token0_decimals } else { pool.token1_decimals };
+            let dec_out = if swap.token_out == pool.token0 { pool.token0_decimals } else { pool.token1_decimals };
+            (dec_in, dec_out)
+        } else {
+            (18u8, 18u8)
+        };
 
-        // Get the swap amounts
-        let amount_in_f64 = swap.amount_in.as_u128() as f64;
-        let amount_out_f64 = swap.amount_out.as_u128() as f64;
+        let amount_in_f64 = crate::types::normalize_units(swap.amount_in, dec_in);
+        let amount_out_f64 = crate::types::normalize_units(swap.amount_out, dec_out);
 
-        // For first swaps, we consider them significant if they're large enough
-        // Use a threshold based on typical pool sizes (this is heuristic)
-        let significant_threshold = 10_000.0; // Adjust based on token decimals and typical pool sizes
+        let significant_threshold = 10_000.0;
 
         if amount_in_f64 > significant_threshold || amount_out_f64 > significant_threshold {
             debug!(
@@ -1624,8 +1664,6 @@ impl ReactiveSwapStrategy {
                 amount_in_f64, amount_out_f64, swap.pool_address, block
             );
 
-            // Estimate impact as a high percentage for first swaps to ensure they're considered
-            // This is conservative - better to over-estimate than miss opportunities
             let estimated_impact = 5.0; // 5% estimated impact for first swaps
 
             debug!(
@@ -1685,8 +1723,15 @@ impl ReactiveSwapStrategy {
                             }
                         };
                         let decimals = if swap.token_in == pool_info.token0 { pool_info.token0_decimals } else { pool_info.token1_decimals };
-                        let profit_tokens = (profit_wei.as_u128() as f64) / (10u128.pow(decimals as u32) as f64);
-                        let profit_usd = match infra.price_oracle.get_token_price_usd(&chain_name, swap.token_in).await {
+                        let profit_tokens = crate::types::normalize_units(profit_wei, decimals);
+                        let block_ts = infra
+                            .blockchain_manager
+                            .get_block(block.into())
+                            .await
+                            .ok()
+                            .and_then(|opt| opt.map(|b| b.timestamp.as_u64()))
+                            .unwrap_or(0);
+                        let profit_usd = match infra.price_oracle.get_token_price_usd_at(&chain_name, swap.token_in, Some(block), Some(block_ts)).await {
                             Ok(price) => profit_tokens * price,
                             Err(e) => {
                                 debug!("Failed to get token price for profit calculation: {}", e);
@@ -1706,7 +1751,7 @@ impl ReactiveSwapStrategy {
                                 Err(_) => 0,
                             };
 
-                            // Convert PathLegs to ArbitrageRouteLegs
+                            // Convert PathLegs to ArbitrageRouteLegs with per-leg amounts
                             let arbitrage_legs: Vec<crate::types::ArbitrageRouteLeg> = path.legs.iter().map(|leg| {
                                 crate::types::ArbitrageRouteLeg {
                                     dex_name: format!("{:?}", leg.protocol_type),
@@ -1714,10 +1759,10 @@ impl ReactiveSwapStrategy {
                                     pool_address: leg.pool_address,
                                     token_in: leg.from_token,
                                     token_out: leg.to_token,
-                                    amount_in: swap.amount_out,
-                                    min_amount_out: U256::zero(),
+                                    amount_in: leg.amount_in,
+                                    min_amount_out: leg.amount_out,
                                     fee_bps: leg.fee,
-                                    expected_out: Some(expected_output),
+                                    expected_out: Some(leg.amount_out),
                                 }
                             }).collect();
 
@@ -1731,10 +1776,10 @@ impl ReactiveSwapStrategy {
                                     estimated_gas_cost_wei: U256::from(150_000u64 * 30_000_000_000u64), // Rough gas estimate
                                     price_impact_bps: 50, // Default 50 bps impact
                                     route_description: format!("Reactive arbitrage triggered by swap in pool {}", swap.pool_address),
-                                    risk_score: 0.3, // Default moderate risk
+                                    risk_score: (1.0 - path.confidence_score).min(1.0).max(0.0),
                                     chain_id: infra.blockchain_manager.get_chain_id(),
-                                    created_at_ns: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64,
-                                    mev_risk_score: 0.5, // Default moderate risk
+                                    created_at_ns: block_ts.saturating_mul(1_000_000_000),
+                                    mev_risk_score: (1.0 - path.mev_resistance_score).min(1.0).max(0.0),
                                     flashloan_amount_wei: None,
                                     flashloan_fee_wei: None,
                                     token_in: swap.token_out,
@@ -1743,16 +1788,13 @@ impl ReactiveSwapStrategy {
                                     amount_out: expected_output,
                                 },
                                 block_number: block,
-                                block_timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
+                                block_timestamp: block_ts,
                                 profit_usd,
                                 profit_token_amount: profit_wei,
                                 profit_token: swap.token_in,
                                 estimated_gas_cost_wei: U256::from(150_000u64 * 30_000_000_000u64),
-                                risk_score: 0.3,
-                                mev_risk_score: 0.5,
+                                risk_score: (1.0 - path.confidence_score).min(1.0).max(0.0),
+                                mev_risk_score: (1.0 - path.mev_resistance_score).min(1.0).max(0.0),
                                 simulation_result: None,
                                 token_in: swap.token_out,
                                 token_out: swap.token_in,
@@ -1833,21 +1875,8 @@ impl OpportunityDiscoveryStrategy for ReactiveSwapStrategy {
             unique_pools.insert(swap.pool_address);
         }
 
-        // Use the shared path finder from infrastructure instead of creating a new one
-        let path_finder = infra.path_finder.clone();
-
-        // Set block context and rebuild graph to include all tokens and pools
-        if let Err(e) = path_finder.set_block_context(block).await {
-            warn!("Failed to set block context: {}", e);
-        }
-
-        // Rebuild graph for this block to include all tokens and pools
-        if let Err(e) = path_finder.build_graph_for_block(Some(block)).await {
-            warn!("Failed to build graph for block {}: {}", block, e);
-            *rejection_stats.entry("failed_to_build_graph".to_string()).or_insert(0) += 1;
-        } else {
-            debug!("Successfully rebuilt graph for block {} with {} unique tokens and {} pools", block, unique_tokens.len(), unique_pools.len());
-        }
+        // Use the shared path finder from infrastructure; graph was already built in process_block
+        let _path_finder = infra.path_finder.clone();
 
 
         // Group swaps by transaction for analysis
@@ -1867,7 +1896,7 @@ impl OpportunityDiscoveryStrategy for ReactiveSwapStrategy {
             // Analyze each swap for price impact and arbitrage opportunities
             for swap in &tx_swaps {
                 // First analyze the price impact of this swap
-                match self.analyze_swap_impact(swap, infra, block).await {
+                match self.analyze_swap_impact(swap, infra, block, _current_block_pool_states).await {
                     Ok(Some(impact)) => {
                         debug!(
                             "Swap {} has significant price impact: {:.2}%. Looking for arbitrage paths...",
@@ -1948,9 +1977,26 @@ impl OpportunityDiscoveryStrategy for ReactiveSwapStrategy {
             // Use the PathFinder directly instead of ArbitrageEngine for more efficient discovery
             if let Some(first_swap) = tx_swaps.first() {
                 // Use PathFinder to find circular arbitrage paths starting from the swapped token
+                // Determine a sensible amount_in based on token_out decimals (1 whole token)
+                let dec_out = {
+                    let chain_name = infra.blockchain_manager.get_chain_name();
+                    // Try current block state first, else previous block
+                    let pool_res_now = infra.pool_manager.get_pool_info(&chain_name, first_swap.pool_address, Some(block)).await;
+                    let pool_dec = match pool_res_now {
+                        Ok(pool) => if first_swap.token_out == pool.token0 { pool.token0_decimals } else { pool.token1_decimals },
+                        Err(_) => {
+                            match infra.pool_manager.get_pool_info(&chain_name, first_swap.pool_address, Some(block.saturating_sub(1))).await {
+                                Ok(pool) => if first_swap.token_out == pool.token0 { pool.token0_decimals } else { pool.token1_decimals },
+                                Err(_) => 18,
+                            }
+                        }
+                    };
+                    pool_dec
+                };
+                let one_unit_out = U256::exp10(dec_out as usize);
                 match infra.path_finder.find_circular_arbitrage_paths(
                     first_swap.token_out,
-                    U256::from(1_000_000_000_000_000_000u64), // 1 ETH equivalent
+                    one_unit_out,
                     Some(block)
                 ).await {
                     Ok(paths) => {
@@ -1959,15 +2005,23 @@ impl OpportunityDiscoveryStrategy for ReactiveSwapStrategy {
                         // Convert paths to opportunities using the existing AlphaEngine approach
                         for path in &paths {
                             // Calculate potential profit and create opportunity
-                            if let Ok(amount_out) = infra.path_finder.calculate_path_output_amount(&path, U256::from(1_000_000_000_000_000_000u64), Some(block)).await {
-                                let profit_amount = amount_out.saturating_sub(U256::from(1_000_000_000_000_000_000u64));
+                            if let Ok(amount_out) = infra.path_finder.calculate_path_output_amount(&path, one_unit_out, Some(block)).await {
+                                let profit_amount = amount_out.saturating_sub(one_unit_out);
 
                                 // Convert profit to USD for threshold check
-                                if let Some(profit_usd) = infra.price_oracle.convert_token_to_usd(
-                                    &first_swap.chain_name,
-                                    profit_amount,
-                                    first_swap.token_out
-                                ).await.ok() {
+                                let block_ts = infra
+                                    .blockchain_manager
+                                    .get_block(block.into())
+                                    .await
+                                    .ok()
+                                    .and_then(|opt| opt.map(|b| b.timestamp.as_u64()))
+                                    .unwrap_or(0);
+                                let price_res = infra.price_oracle.get_token_price_usd_at(&first_swap.chain_name, first_swap.token_out, Some(block), Some(block_ts)).await;
+                                if let Ok(price_out) = price_res {
+                                    // determine decimals for token_out
+                                    let dec_out_for_norm = dec_out;
+                                    let profit_tokens = crate::types::normalize_units(profit_amount, dec_out_for_norm);
+                                    let profit_usd: f64 = profit_tokens * price_out;
                                     if profit_usd > self.thresholds.min_profit_usd {
                                         // Create opportunity using existing logic
                                         let opportunity = crate::types::ArbitrageOpportunity {
@@ -1985,24 +2039,21 @@ impl OpportunityDiscoveryStrategy for ReactiveSwapStrategy {
                                                         expected_out: Some(leg.amount_out),
                                                     }
                                                 }).collect(),
-                                                initial_amount_in_wei: U256::from(1_000_000_000_000_000_000u64), // 1 ETH equivalent
+                                                initial_amount_in_wei: one_unit_out,
                                                 amount_out_wei: amount_out,
                                                 profit_usd,
                                                 estimated_gas_cost_wei: U256::from(300_000_000_000_000u64), // 300k gas * 1 gwei
                                                 price_impact_bps: 50, // Default 50 bps impact
                                                 route_description: format!("reactive_arbitrage_{}", first_swap.tx_hash),
-                                                risk_score: 0.1, // Conservative risk score
+                                                risk_score: (1.0f64 - 0.8f64).max(0.0f64).min(1.0f64),
                                                 chain_id: infra.blockchain_manager.get_chain_id(),
-                                                created_at_ns: std::time::SystemTime::now()
-                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                    .unwrap()
-                                                    .as_nanos() as u64,
-                                                mev_risk_score: 0.2,
+                                                created_at_ns: block_ts.saturating_mul(1_000_000_000),
+                                                mev_risk_score: (1.0f64 - 0.8f64).max(0.0f64).min(1.0f64),
                                                 flashloan_amount_wei: None,
                                                 flashloan_fee_wei: None,
                                                 token_in: first_swap.token_in,
                                                 token_out: first_swap.token_out,
-                                                amount_in: U256::from(1_000_000_000_000_000_000u64), // 1 ETH equivalent
+                                                amount_in: one_unit_out,
                                                 amount_out,
                                             },
                                             block_number: block,
@@ -2011,8 +2062,8 @@ impl OpportunityDiscoveryStrategy for ReactiveSwapStrategy {
                                             profit_token_amount: profit_amount,
                                             profit_token: first_swap.token_out,
                                             estimated_gas_cost_wei: U256::from(300_000_000_000_000u64), // 300k gas * 1 gwei
-                                            risk_score: 0.1, // Conservative risk score
-                                            mev_risk_score: 0.2,
+                                            risk_score: (1.0f64 - 0.8f64).max(0.0f64).min(1.0f64),
+                                            mev_risk_score: (1.0f64 - 0.8f64).max(0.0f64).min(1.0f64),
                                             simulation_result: None,
                                             metadata: Some(serde_json::json!({
                                                 "strategy": "reactive_swap",
@@ -2023,7 +2074,7 @@ impl OpportunityDiscoveryStrategy for ReactiveSwapStrategy {
                                             })),
                                             token_in: first_swap.token_in,
                                             token_out: first_swap.token_out,
-                                            amount_in: U256::from(1_000_000_000_000_000_000u64), // 1 ETH equivalent
+                                            amount_in: one_unit_out,
                                             chain_id: infra.blockchain_manager.get_chain_id(),
                                         };
 
@@ -2380,6 +2431,9 @@ pub struct ChainInfra {
     pub transaction_optimizer:Arc<TransactionOptimizerV2>,
     pub gas_oracle:           Arc<dyn GasOracleProvider + Send + Sync>,
     pub price_oracle:         Arc<dyn PriceOracle + Send + Sync>,
+    /// Strongly-typed handle to the historical price provider wrapper used across the system
+    /// so we can update block context consistently for all dependent components.
+    pub price_oracle_wrapper: Option<Arc<HistoricalPriceProviderWrapper>>,
     pub historical_price_provider: Option<Arc<HistoricalPriceProvider>>,
     pub path_finder:          Arc<dyn PathFinder + Send + Sync>,
     pub risk_manager:         Arc<RwLock<Option<Arc<dyn RiskManager + Send + Sync>>>>,
@@ -2412,15 +2466,13 @@ impl ChainInfra {
             strict_backtest,
         ));
 
-        // Create new price oracle for this block
-        let price_oracle = Arc::new(HistoricalPriceProvider::new(
-            chain_name,
-            block,
-            None, // unix_ts
-            swap_loader,
-            chain_config,
-            strict_backtest,
-        ).map_err(|e| anyhow::anyhow!("Failed to create price oracle: {}", e))?);
+        // Update block context on the shared price oracle wrapper to keep all components consistent
+        if let Some(wrapper) = &self.price_oracle_wrapper {
+            wrapper
+                .set_block_context(block)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to update price oracle block context: {}", e))?;
+        }
 
         // Create new infrastructure with updated providers
         let new_infra = Arc::new(Self {
@@ -2429,7 +2481,8 @@ impl ChainInfra {
             pool_state_oracle: self.pool_state_oracle.clone(),
             transaction_optimizer: self.transaction_optimizer.clone(),
             gas_oracle,
-            price_oracle,
+            price_oracle: self.price_oracle.clone(),
+            price_oracle_wrapper: self.price_oracle_wrapper.clone(),
             historical_price_provider: self.historical_price_provider.clone(),
             path_finder: self.path_finder.clone(),
             risk_manager: self.risk_manager.clone(),
@@ -2449,7 +2502,7 @@ pub struct BacktestQuoteSource {
     price_oracle: Arc<dyn PriceOracle + Send + Sync>,
     gas_oracle: Arc<dyn GasOracleProvider + Send + Sync>,
     // Current block number for block-aware pool discovery in backtesting
-    current_block: std::sync::RwLock<Option<u64>>,
+    current_block: SyncRwLock<Option<u64>>,
 }
 
 pub struct HistoricalPriceProviderWrapper {
@@ -2598,11 +2651,8 @@ impl PriceOracle for HistoricalPriceProviderWrapper {
         amount: ethers::types::U256,
         token: Address,
     ) -> Result<f64, PriceError> {
-        let price = self.get_token_price_usd(chain_name, token).await?;
-        let amount_f64 = amount.as_u128() as f64;
-        let decimals = 18; // Default to 18 decimals for historical data
-        let normalized_amount = amount_f64 / (10_u128.pow(decimals) as f64);
-        Ok(normalized_amount * price)
+        let provider = self.provider.read().await.clone();
+        provider.convert_token_to_usd(chain_name, amount, token).await
     }
 
     async fn convert_native_to_usd(
@@ -2610,13 +2660,8 @@ impl PriceOracle for HistoricalPriceProviderWrapper {
         chain_name: &str,
         amount_native: ethers::types::U256,
     ) -> Result<f64, PriceError> {
-        let weth_address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".parse::<Address>()
-            .map_err(|e| PriceError::PriceLookup(format!("Invalid WETH address: {}", e)))?;
-        let price = self.get_token_price_usd(chain_name, weth_address).await?;
-        let amount_f64 = amount_native.as_u128() as f64;
-        let decimals = 18; // Native tokens typically have 18 decimals
-        let normalized_amount = amount_f64 / (10_u128.pow(decimals) as f64);
-        Ok(normalized_amount * price)
+        let provider = self.provider.read().await.clone();
+        provider.convert_native_to_usd(chain_name, amount_native).await
     }
 
     async fn estimate_token_conversion(
@@ -2626,23 +2671,8 @@ impl PriceOracle for HistoricalPriceProviderWrapper {
         token_in: Address,
         token_out: Address,
     ) -> Result<ethers::types::U256, PriceError> {
-        let price_in = self.get_token_price_usd(chain_name, token_in).await?;
-        let price_out = self.get_token_price_usd(chain_name, token_out).await?;
-        
-        if price_out == 0.0 {
-            return Err(PriceError::Calculation("Output token price is zero".to_string()));
-        }
-        
-        let amount_in_f64 = amount_in.as_u128() as f64;
-        let decimals_in = 18; // Default to 18 decimals
-        let decimals_out = 18; // Default to 18 decimals
-        
-        let normalized_amount_in = amount_in_f64 / (10_u128.pow(decimals_in) as f64);
-        let usd_value = normalized_amount_in * price_in;
-        let normalized_amount_out = usd_value / price_out;
-        let amount_out = normalized_amount_out * (10_u128.pow(decimals_out) as f64);
-        
-        Ok(ethers::types::U256::from(amount_out as u128))
+        let provider = self.provider.read().await.clone();
+        provider.estimate_token_conversion(chain_name, amount_in, token_in, token_out).await
     }
 
     async fn estimate_swap_value_usd(
@@ -2653,35 +2683,8 @@ impl PriceOracle for HistoricalPriceProviderWrapper {
         amount_in: U256,
     ) -> Result<f64, PriceError> {
         let provider = self.provider.read().await;
-        
-        // Get prices for both tokens
-        let price_in = provider.get_token_price_usd(chain_name, token_in).await?;
-        let price_out = provider.get_token_price_usd(chain_name, token_out).await?;
-        
-        // Convert amount_in to f64 (assuming 18 decimals for simplicity)
-        let amount_in_f64 = amount_in.as_u128() as f64 / 1e18;
-        
-        // Calculate USD value based on input token price
-        let usd_value_in = amount_in_f64 * price_in;
-        
-        // Estimate output amount assuming a 1:1 exchange ratio as baseline
-        // This is simplified; real implementation would query pool reserves
-        let estimated_amount_out = amount_in_f64;
-        let estimated_usd_value_out = estimated_amount_out * price_out;
-        
-        // Calculate potential price impact and arbitrage opportunity
-        let price_ratio = price_out / price_in;
-        let efficiency_factor = if price_ratio > 1.0 {
-            // Output token is more valuable - positive arbitrage potential
-            0.98 // Account for slippage and fees
-        } else {
-            // Output token is less valuable - potential loss
-            1.02 // Account for slippage and fees working against us
-        };
-        
-        // Return the more conservative estimate between input and adjusted output value
-        let adjusted_output_value = estimated_usd_value_out * efficiency_factor;
-        Ok(usd_value_in.min(adjusted_output_value))
+        // Delegate to provider which knows actual decimals; provider may be block-aware
+        provider.estimate_swap_value_usd(chain_name, token_in, token_out, amount_in).await
     }
 }
 
@@ -2695,7 +2698,7 @@ impl BacktestQuoteSource {
             pool_manager,
             price_oracle,
             gas_oracle,
-            current_block: std::sync::RwLock::new(None),
+            current_block: SyncRwLock::new(None),
         }
     }
 
@@ -2710,18 +2713,18 @@ impl BacktestQuoteSource {
             pool_manager,
             price_oracle,
             gas_oracle,
-            current_block: std::sync::RwLock::new(Some(current_block)),
+            current_block: SyncRwLock::new(Some(current_block)),
         }
     }
 
     /// Set the current block number for block-aware pool discovery in backtesting
     pub fn set_current_block(&self, block_number: u64) {
-        *self.current_block.write().unwrap() = Some(block_number);
+        *self.current_block.write() = Some(block_number);
     }
 
     /// Clear the current block number (for live mode)
     pub fn clear_current_block(&self) {
-        *self.current_block.write().unwrap() = None;
+        *self.current_block.write() = None;
     }
 }
 
@@ -2739,7 +2742,7 @@ impl AggregatorQuoteSource for BacktestQuoteSource {
         
         // CRITICAL: Use block-aware pool discovery in backtesting to prevent future pool leakage
         // Extract current block before await to avoid Send issues
-        let current_block_opt = *self.current_block.read().unwrap();
+        let current_block_opt = *self.current_block.read();
         let pools = if let Some(current_block) = current_block_opt {
             // In backtesting mode with current block set, only consider pools that existed at that block
             self.pool_manager.get_pools_for_pair_at_block(&chain_name, token_in, token_out, current_block).await
@@ -2911,11 +2914,15 @@ impl BacktestQuoteSource {
         amount_out: U256,
         pool_info: &crate::types::PoolInfo,
     ) -> Result<(), DexError> {
-        // Get current market prices for both tokens
-        let token_in_price = self.price_oracle.get_token_price_usd(chain_name, token_in).await
+        // Derive current block for backtest pricing alignment
+        let current_block_opt = *self.current_block.read();
+        let block_ts = None; // No timestamp available here; wrapper will use block context
+
+        // Get block-aware market prices for both tokens
+        let token_in_price = self.price_oracle.get_token_price_usd_at(chain_name, token_in, current_block_opt, block_ts).await
             .map_err(|e| DexError::Other(format!("Failed to get token_in price: {}", e)))?;
         
-        let token_out_price = self.price_oracle.get_token_price_usd(chain_name, token_out).await
+        let token_out_price = self.price_oracle.get_token_price_usd_at(chain_name, token_out, current_block_opt, block_ts).await
             .map_err(|e| DexError::Other(format!("Failed to get token_out price: {}", e)))?;
 
         if token_in_price <= 0.0 || token_out_price <= 0.0 {
@@ -3202,14 +3209,17 @@ impl Backtester {
         info!("Backtester created with {} chains", chains.len());
 
         // Initialize thresholds
-        let thresholds = BacktestThresholds {
-            min_profit_usd: backtest_cfg.min_profit_usd.unwrap_or(MIN_PROFIT_THRESHOLD_USD),
-            min_confidence_score: backtest_cfg.confidence_threshold.unwrap_or(MIN_CONFIDENCE_SCORE),
-            min_mev_resistance: backtest_cfg.mev_resistance_threshold.unwrap_or(MIN_MEV_RESISTANCE),
-            max_opportunities_per_block: backtest_cfg.max_opportunities_per_block.unwrap_or(DEFAULT_MAX_OPPORTUNITIES_PER_BLOCK),
-            max_tokens_per_scan: backtest_cfg.max_tokens_per_block_scan.unwrap_or(DEFAULT_MAX_TOKENS_PER_SCAN),
-            scan_usd_amounts: backtest_cfg.scan_usd_amounts.clone(),
-        };
+        let mut thresholds = BacktestThresholds::default();
+        thresholds.min_profit_usd = backtest_cfg.min_profit_usd.unwrap_or(MIN_PROFIT_THRESHOLD_USD);
+        thresholds.min_confidence_score = backtest_cfg.confidence_threshold.unwrap_or(MIN_CONFIDENCE_SCORE);
+        thresholds.min_mev_resistance = backtest_cfg.mev_resistance_threshold.unwrap_or(MIN_MEV_RESISTANCE);
+        thresholds.max_opportunities_per_block = backtest_cfg
+            .max_opportunities_per_block
+            .unwrap_or(DEFAULT_MAX_OPPORTUNITIES_PER_BLOCK);
+        thresholds.max_tokens_per_scan = backtest_cfg
+            .max_tokens_per_block_scan
+            .unwrap_or(DEFAULT_MAX_TOKENS_PER_SCAN);
+        thresholds.scan_usd_amounts = backtest_cfg.scan_usd_amounts.clone();
         
         // Initialize discovery strategies
         let mut strategies: Vec<Box<dyn OpportunityDiscoveryStrategy>> = Vec::new();
@@ -3469,9 +3479,10 @@ impl Backtester {
             self.global_cfg.strict_backtest,
         ).map_err(|e| BacktestError::InfraInit(format!("Failed to create historical price provider: {}", e)))?);
         
-        let base_price_oracle = Arc::new(HistoricalPriceProviderWrapper {
+        let base_wrapper_arc = Arc::new(HistoricalPriceProviderWrapper {
             provider: Arc::new(RwLock::new(base_historical_price_provider.clone())),
-        }) as Arc<dyn PriceOracle + Send + Sync>;
+        });
+        let base_price_oracle = base_wrapper_arc.clone() as Arc<dyn PriceOracle + Send + Sync>;
 
         let rps_limit = chain_cfg.rps_limit.unwrap_or(
             self.global_cfg.chain_config.rate_limiter_settings.default_chain_rps_limit
@@ -3631,6 +3642,7 @@ impl Backtester {
             transaction_optimizer: tx_opt,
             gas_oracle: base_gas_oracle,
             price_oracle: base_price_oracle,
+            price_oracle_wrapper: Some(base_wrapper_arc),
             path_finder,
             risk_manager: risk_mgr,
             predictive_engine,
@@ -3671,35 +3683,29 @@ impl Backtester {
             quote_source.set_current_block(block);
         }
 
+        // Price oracle wrapper block context is updated once in ChainInfra::for_block
+
         // Set block context for pool state oracle to clear caches
         if let Err(e) = infra.pool_state_oracle.set_block_context(block).await {
             warn!("Failed to set block context on pool state oracle: {}", e);
         }
 
-        // Build graph once per block with block-valid pools to prevent redundant rebuilding
+        // Build graph once per block. The pool registry has already been constrained to the block
+        // via set_block_context + reload_registry_for_backtest above, so we can load pool infos directly.
         let chain_name = infra.blockchain_manager.get_chain_name().to_string();
         let block_valid_pools = match infra.pool_manager.get_all_pools(&chain_name, None).await {
             Ok(pools) => {
-                // Filter pools by creation block to prevent lookahead bias
-                let valid_metadata: Vec<Arc<crate::pool_manager::PoolStaticMetadata>> = pools
-                    .into_iter()
-                    .filter(|pool| pool.creation_block <= block)
-                    .collect();
-
-                // Convert metadata to full PoolInfo objects
-                let mut valid_pools = Vec::new();
-                for metadata in valid_metadata {
+                let mut valid_pools = Vec::with_capacity(pools.len());
+                for metadata in pools.into_iter() {
                     match infra.pool_manager.get_pool_info(&chain_name, metadata.pool_address, Some(block)).await {
                         Ok(pool_info) => valid_pools.push(pool_info),
-                        Err(e) => {
-                            debug!("Failed to get pool info for {}: {}, skipping", metadata.pool_address, e);
-                        }
+                        Err(e) => debug!("Failed to get pool info for {}: {}, skipping", metadata.pool_address, e),
                     }
                 }
                 valid_pools
             }
             Err(e) => {
-                debug!("Failed to get block-valid pools for graph building: {}", e);
+                debug!("Failed to get pools for graph building: {}", e);
                 Vec::new()
             }
         };
@@ -3782,8 +3788,8 @@ impl Backtester {
             // Enforce thresholds before simulation to bound queue size
             block_discovered.retain(|opp| {
                 opp.profit_usd > self.thresholds.min_profit_usd
-                    && opp.route.risk_score <= (1.0 - self.thresholds.min_confidence_score)
-                    && opp.mev_risk_score >= self.thresholds.min_mev_resistance
+                    && opp.risk_score <= (1.0 - self.thresholds.min_confidence_score)
+                    && opp.mev_risk_score <= (1.0 - self.thresholds.min_mev_resistance)
             });
 
             // Store length before extend moves the vector
@@ -3936,23 +3942,26 @@ impl Backtester {
         scan_time_ms: u64,
         rejection_stats: std::collections::HashMap<String, u64>,
     ) -> BlockResult {
-        // Count opportunities by type (basic; detailed classification can be added later)
-        let mut proactive_count = 0;
-        let reactive_count = 0;
-        let hot_token_count = 0;
-        let mut cross_dex_count = 0;
+        // Count opportunities by strategy label in metadata for accurate categorization
+        let mut proactive_count = 0usize;
+        let mut reactive_count = 0usize;
+        let mut hot_token_count = 0usize;
+        let mut cross_dex_count = 0usize;
         for opp in &opportunities {
-            let distinct_protocols: std::collections::HashSet<_> = opp
-                .route
-                .legs
-                .iter()
-                .map(|l| l.protocol_type.clone())
-                .collect();
-            if distinct_protocols.len() > 1 {
-                cross_dex_count += 1;
-            } else {
-                proactive_count += 1;
+            if let Some(meta) = &opp.metadata {
+                if let Some(strategy) = meta.get("strategy").and_then(|v| v.as_str()) {
+                    match strategy {
+                        "proactive_scan" => proactive_count = proactive_count.saturating_add(1),
+                        "reactive_swap" => reactive_count = reactive_count.saturating_add(1),
+                        "hot_token" => hot_token_count = hot_token_count.saturating_add(1),
+                        "cross_dex" => cross_dex_count = cross_dex_count.saturating_add(1),
+                        _ => proactive_count = proactive_count.saturating_add(1),
+                    }
+                    continue;
+                }
             }
+            // Fallback categorization if metadata is missing
+            proactive_count = proactive_count.saturating_add(1);
         }
         
         BlockResult {

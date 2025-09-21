@@ -17,14 +17,12 @@ use ethers::{
 };
 use tokio::time::timeout;
 use tracing::{info, debug, warn, error};
-use eyre::{Result, WrapErr, eyre};
+use eyre::{Result, WrapErr};
 use std::fs;
 use rust::types::SwapEvent;
 use hex;
 use ethers::utils::AnvilInstance;
 use tokio::sync::RwLock;
-use tokio::runtime::{Builder, Runtime};
-use tokio::sync::{Mutex};
 
 use rust::{
     config::{Config, ChainConfig, PerChainConfig, ModuleConfig, ArbitrageSettings, PathFinderSettings,
@@ -408,6 +406,8 @@ impl TestHarness {
                 ws_max_backoff_delay_ms: Some(30000),
                 ws_backoff_jitter_factor: Some(0.1),
                 subscribe_pending_txs: Some(false),
+                major_intermediaries: None,
+                use_token_prices_table: Some(false),
             },
         );
         config.backtest = None;
@@ -494,6 +494,8 @@ impl TestHarness {
                 backtest_default_priority_fee_gwei: 1,
                 protocol_gas_estimates: HashMap::new(),
                 default_gas_estimate: 15000,
+                nearby_window_blocks: Some(10),
+                block_distance_tolerance: Some(5),
             },
             blockchain_settings: BlockchainSettings {
                 nonce_grace_blocks: 5,
@@ -1155,6 +1157,8 @@ impl TestHarness {
                     backtest_default_priority_fee_gwei: 1,
                     protocol_gas_estimates: HashMap::new(),
                     default_gas_estimate: 15000,
+                    nearby_window_blocks: Some(10),
+                    block_distance_tolerance: Some(5),
                 },
                 blockchain_settings: BlockchainSettings {
                     nonce_grace_blocks: 5,
@@ -1274,6 +1278,8 @@ impl TestHarness {
                 ws_max_backoff_delay_ms: Some(30000),
                 ws_backoff_jitter_factor: Some(0.1),
                 subscribe_pending_txs: Some(false),
+                major_intermediaries: None,
+                use_token_prices_table: None,
             };
         config.chain_config.chains.insert(chain_name, per_chain_config);
         Ok(Arc::new(config))
@@ -2878,6 +2884,11 @@ impl TestHarness {
             v3_amount0: None,
             v3_amount1: None,
             v3_tick_data: None,
+            price_from_in_usd: None,
+            price_to_in_usd: None,
+            token0_price_usd: None,
+            token1_price_usd: None,
+            pool_liquidity_usd: None,
         })
     }
 

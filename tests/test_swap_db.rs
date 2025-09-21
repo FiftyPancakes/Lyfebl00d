@@ -71,6 +71,8 @@ fn create_test_chain_config() -> ChainConfig {
                 ws_max_backoff_delay_ms: Some(30000),
                 ws_backoff_jitter_factor: Some(0.1),
                 subscribe_pending_txs: Some(false),
+                major_intermediaries: None,
+                use_token_prices_table: None,
             },
         );
 

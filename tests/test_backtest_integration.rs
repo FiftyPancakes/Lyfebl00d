@@ -124,6 +124,7 @@ mod test_backtest_integration {
             backtest_end_block: 2000,
             backtest_archival_rpc_url: "https://ethereum-mainnet.core.chainstack.com/8289696ba41f04594614780bac26a4ef".to_string(),
             backtest_result_output_file: "/tmp/test_results.json".to_string(),
+            price_oracle: None,
         };
         
         assert!(chain_config.enabled);

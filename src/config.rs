@@ -54,6 +54,13 @@ impl From<SecretData> for Secrets {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceOracleConfig {
+    pub native_asset_address: Address,
+    pub stablecoin_address: Address,
+    pub native_stable_pool: Address,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GasEstimates {
     pub uniswap_v2: u64,
     pub uniswap_v3: u64,
@@ -738,6 +745,9 @@ pub struct BacktestChainConfig {
     pub backtest_end_block: u64,
     pub backtest_archival_rpc_url: String,
     pub backtest_result_output_file: String,
+    /// Configuration for historical USD pricing via reference pools
+    #[serde(default)]
+    pub price_oracle: Option<PriceOracleConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -34,7 +34,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use chrono::{DateTime, Utc};
+use chrono::{Utc, TimeZone};
+use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{anyhow, Result};
 use deadpool_postgres::Pool;
 use ethers::types::{Address, H256, U256};
@@ -42,6 +43,7 @@ use moka::future::Cache;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use std::str::FromStr;
 use tracing::{info, instrument, trace, warn, debug, error};
+use reqwest::Client;
 
 use crate::{
     config::ChainConfig,
@@ -51,6 +53,9 @@ use crate::{
     },
     v4_support::{is_v4_protocol},
 };
+
+// Log-once flag for token_prices table fallback warnings
+static TOKEN_PRICES_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 pub struct PriceData {
@@ -78,6 +83,8 @@ pub struct HistoricalSwapLoader {
     
     // Metrics
     metrics: Arc<LoaderMetrics>,
+    // Shared HTTP client for external price lookups
+    http_client: Client,
 }
 
 #[derive(Debug, Default)]
@@ -89,6 +96,17 @@ struct LoaderMetrics {
 }
 
 impl HistoricalSwapLoader {
+    /// Safe Decimal -> U256 conversion using decimal string to avoid overflow/truncation.
+    fn decimal_to_u256_safe(&self, value: Decimal, default: U256) -> U256 {
+        let s = value.trunc().to_string();
+        U256::from_dec_str(&s).unwrap_or(default)
+    }
+
+    /// 10^exp as Decimal using string construction (avoids float conversions)
+    fn decimal_pow10(&self, exp: u32) -> Decimal {
+        let s = format!("1e{}", exp);
+        Decimal::from_str(&s).unwrap_or(Decimal::ONE)
+    }
     pub async fn new(
         db_pool: Arc<Pool>,
         chain_config: Arc<ChainConfig>,
@@ -104,6 +122,12 @@ impl HistoricalSwapLoader {
         
         info!("HistoricalSwapLoader initialized with database pool");
         
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("historical-swap-loader/1.0")
+            .build()
+            .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?;
+
         Ok(Self {
             db_pool,
             chain_config,
@@ -129,7 +153,62 @@ impl HistoricalSwapLoader {
                 .build(),
             block_gas_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             metrics: Arc::new(LoaderMetrics::default()),
+            http_client,
         })
+    }
+
+    /// Safely retrieve a large numeric column that may exceed u128 limits and convert to U256 if possible.
+    /// Supports sources stored as Decimal, i128, i64, bytea (big-endian), or text hex (0x...)
+    fn try_get_u256_numeric(&self, row: &tokio_postgres::Row, col: &str) -> Option<U256> {
+        // Try Decimal first
+        if let Ok(opt_dec) = row.try_get::<_, Option<Decimal>>(col) {
+            if let Some(d) = opt_dec {
+                if let Some(v) = d.to_u128() {
+                    return Some(U256::from(v));
+                }
+            }
+        }
+        // Skip i128 direct reads as it is not supported by tokio_postgres; rely on Decimal/i64/bytea/text
+        // Try i64
+        if let Ok(opt_i64) = row.try_get::<_, Option<i64>>(col) {
+            if let Some(v) = opt_i64 {
+                if v >= 0 {
+                    return Some(U256::from(v as u128));
+                }
+            }
+        }
+        // Try bytea (big-endian)
+        if let Ok(opt_bytes) = row.try_get::<_, Option<Vec<u8>>>(col) {
+            if let Some(bytes) = opt_bytes {
+                let mut buf = [0u8; 32];
+                if bytes.len() <= 32 {
+                    buf[(32 - bytes.len())..].copy_from_slice(&bytes);
+                    return Some(U256::from_big_endian(&buf));
+                }
+            }
+        }
+        // Try hex text
+        if let Ok(opt_str) = row.try_get::<_, Option<String>>(col) {
+            if let Some(s) = opt_str {
+                let s_clean = s.trim_start_matches("0x");
+                if s_clean.chars().all(|c| c.is_ascii_hexdigit()) && s_clean.len() <= 64 {
+                    let mut buf = [0u8; 32];
+                    if let Ok(mut raw) = hex::decode(s_clean) {
+                        if raw.len() <= 32 {
+                            // Ensure big-endian
+                            if raw.len() < 32 {
+                                let mut tmp = vec![0u8; 32 - raw.len()];
+                                tmp.extend_from_slice(&raw);
+                                raw = tmp;
+                            }
+                            buf.copy_from_slice(&raw);
+                            return Some(U256::from_big_endian(&buf));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Normalize network ID to match database format
@@ -142,7 +221,7 @@ impl HistoricalSwapLoader {
             "binance-smart-chain" | "bsc" | "bnb" => "bsc".to_string(),
             "polygon" | "polygon-pos" | "matic" => "polygon".to_string(),
             "solana" | "sol" => "solana".to_string(),
-            _ => network_id.to_string(),
+            _ => network_id.to_lowercase(),
         }
     }
 
@@ -157,7 +236,7 @@ impl HistoricalSwapLoader {
             "optimism" | "op" => vec!["optimism", "op"],
             "base" => vec!["base"],
             other => vec![other],
-        }.into_iter().map(|s| s.to_string()).collect()
+        }.into_iter().map(|s| s.to_string().to_lowercase()).collect()
     }
 
     /// Get pool states at a specific block by querying the most recent swap data
@@ -172,7 +251,9 @@ impl HistoricalSwapLoader {
         debug!("Fetching all pool states for chain: {}, at start of block: {}", chain_name, block_number);
         
         // Validate chain configuration and build factory filter
-        let chain_config = self.chain_config.chains.get(chain_name)
+        let cfg_key = self.normalize_network_id(chain_name);
+        let chain_config = self.chain_config.chains.get(&cfg_key)
+            .or_else(|| self.chain_config.chains.get(chain_name))
             .ok_or_else(|| anyhow!("Chain '{}' not found in configuration", chain_name))?;
         
         // Use chain configuration to validate network parameters
@@ -180,13 +261,14 @@ impl HistoricalSwapLoader {
             return Err(anyhow!("Chain '{}' has no RPC URL configured", chain_name));
         }
         
-        let aliases = self.chain_aliases(chain_name);
+        // Prepare chain alias list once for all queries below
+        let aliases: Vec<String> = self.chain_aliases(chain_name);
         debug!("Using normalized aliases {:?} for chain '{}'", aliases, chain_name);
 
         let conn = self.db_pool.get().await
             .map_err(|e| anyhow!("Failed to get database connection: {}", e))?;
 
-        // CRITICAL FIX: For backtesting, get the state at the START of the target block,
+        // For backtesting, get the state at the START of the target block,
         // which means the latest state from the END of the previous block (block_number - 1).
         // This prevents lookahead bias in backtesting.
         let previous_block = (block_number - 1).max(0);
@@ -205,7 +287,7 @@ impl HistoricalSwapLoader {
                     transaction_hash, v3_sender, v3_recipient, v3_amount0, v3_amount1
                 FROM swaps
                 WHERE LOWER(network_id) = ANY($1::text[])
-                    -- Get the latest record for each pool UP TO AND INCLUDING the previous block
+                    -- Get the latest record for each pool up to and including the previous block (start-of-block state)
                     AND block_number <= $2
                     AND token0_address IS NOT NULL
                     AND token1_address IS NOT NULL
@@ -267,10 +349,17 @@ impl HistoricalSwapLoader {
         max_lookback_blocks: Option<u64>,
     ) -> Result<Option<PoolStateFromSwaps>> {
         // Check cache first for the exact block
-        let normalized_chain = self.normalize_network_id(chain_name.unwrap_or(""));
-        let cache_key = (normalized_chain.clone(), pool_address, block_number);
-        if let Some(cached) = self.pool_state_cache.get(&cache_key).await {
-            return Ok(cached);
+        let (maybe_cache_key, should_use_cache) = if let Some(c) = chain_name {
+            let normalized_chain = self.normalize_network_id(c);
+            (Some((normalized_chain, pool_address, block_number)), true)
+        } else {
+            // Avoid cross-chain contamination by not caching when chain_name is unknown
+            (None, false)
+        };
+        if let (Some(cache_key), true) = (&maybe_cache_key, should_use_cache) {
+            if let Some(cached) = self.pool_state_cache.get(cache_key).await {
+                return Ok(cached);
+            }
         }
 
         // Use the efficient single-query method
@@ -286,7 +375,9 @@ impl HistoricalSwapLoader {
                     "Using pool state data: pool {}, requested block {}, found state from block {} ({} blocks old)",
                     pool_address, block_number, state.block_number, block_diff
                 );
-                self.pool_state_cache.insert(cache_key, Some(state.clone())).await;
+                if let (Some(cache_key), true) = (&maybe_cache_key, should_use_cache) {
+                    self.pool_state_cache.insert(cache_key.clone(), Some(state.clone())).await;
+                }
                 Ok(Some(state))
             } else {
                 // Data is too old, but for backtesting this should be very rare with the new default
@@ -295,14 +386,18 @@ impl HistoricalSwapLoader {
                     pool_address, block_number, state.block_number, block_diff, max_lookback
                 );
                 // Cache the absence of data to prevent re-querying
-                self.pool_state_cache.insert(cache_key, None).await;
+                if let (Some(cache_key), true) = (&maybe_cache_key, should_use_cache) {
+                    self.pool_state_cache.insert(cache_key.clone(), None).await;
+                }
                 Ok(None)
             }
         } else {
             // No data was found at all
             warn!("No state data found for pool {} at or before block {}", pool_address, block_number);
             // Cache the absence of data to prevent re-querying
-            self.pool_state_cache.insert(cache_key, None).await;
+            if let (Some(cache_key), true) = (&maybe_cache_key, should_use_cache) {
+                self.pool_state_cache.insert(cache_key.clone(), None).await;
+            }
             Ok(None)
         }
     }
@@ -315,11 +410,17 @@ impl HistoricalSwapLoader {
     ) -> Result<Option<PoolStateFromSwaps>> {
         debug!("Fetching pool state for address: {}, block: {}, chain: {:?}", pool_address, block_number, chain_name);
         // Check cache first
-        let normalized_chain = self.normalize_network_id(chain_name.unwrap_or(""));
-        let cache_key = (normalized_chain.clone(), pool_address, block_number);
-        if let Some(cached) = self.pool_state_cache.get(&cache_key).await {
-            self.metrics.cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(cached);
+        let (maybe_cache_key, should_use_cache) = if let Some(c) = chain_name {
+            let normalized_chain = self.normalize_network_id(c);
+            (Some((normalized_chain, pool_address, block_number)), true)
+        } else {
+            (None, false)
+        };
+        if let (Some(ref cache_key), true) = (&maybe_cache_key, should_use_cache) {
+            if let Some(cached) = self.pool_state_cache.get(cache_key).await {
+                self.metrics.cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(cached);
+            }
         }
 
         self.metrics.cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -373,8 +474,7 @@ impl HistoricalSwapLoader {
                     AND block_number <= $3
                     AND token0_address IS NOT NULL
                     AND token1_address IS NOT NULL
-                    -- In backtesting, get pool state from UP TO AND INCLUDING the current block for simulation
-                    -- No additional filtering for reserves or liquidity
+                    -- Backtesting start-of-block state uses the latest state from end of previous block
                 ORDER BY block_number DESC, log_index DESC
                 LIMIT 1
             "#;
@@ -418,8 +518,7 @@ impl HistoricalSwapLoader {
                     AND block_number <= $2
                     AND token0_address IS NOT NULL
                     AND token1_address IS NOT NULL
-                    -- In backtesting, get pool state from UP TO AND INCLUDING the current block for simulation
-                    -- No additional filtering for reserves or liquidity
+                    -- Backtesting start-of-block state uses the latest state from end of previous block
                 ORDER BY block_number DESC, log_index DESC
                 LIMIT 1
             "#;
@@ -453,8 +552,10 @@ impl HistoricalSwapLoader {
             None
         };
         
-        // Cache the result
-        self.pool_state_cache.insert(cache_key, result.clone()).await;
+        // Cache the result only when chain_name is provided
+        if let (Some(cache_key), true) = (&maybe_cache_key, should_use_cache) {
+            self.pool_state_cache.insert(cache_key.clone(), result.clone()).await;
+        }
         self.metrics.queries_executed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         
         Ok(result)
@@ -603,7 +704,7 @@ impl HistoricalSwapLoader {
     ) -> Result<Option<PriceData>> {
         const MAX_RECURSION_DEPTH: u32 = 3;
         
-        let normalized_chain = self.normalize_network_id(chain_name);
+        let _normalized_chain = self.normalize_network_id(chain_name);
         
         // Prevent infinite recursion
         if depth > MAX_RECURSION_DEPTH {
@@ -650,14 +751,17 @@ impl HistoricalSwapLoader {
         }
         
         // Validate chain configuration and get stablecoin addresses
-        let chain_config = self.chain_config.chains.get(chain_name)
+        let cfg_key = self.normalize_network_id(chain_name);
+        let chain_config = self.chain_config.chains.get(&cfg_key)
+            .or_else(|| self.chain_config.chains.get(chain_name))
             .ok_or_else(|| anyhow!("Chain '{}' not found in configuration", chain_name))?;
 
         debug!("Chain config for {}: weth_address={:?}, reference_stablecoins={:?}",
                chain_name, chain_config.weth_address, chain_config.reference_stablecoins);
 
         // Check cache first
-        let cache_key = (normalized_chain.clone(), token, block_number);
+        let normalized_chain_for_cache = self.normalize_network_id(chain_name);
+        let cache_key = (normalized_chain_for_cache.clone(), token, block_number);
         if let Some(cached) = self.price_cache.get(&cache_key).await {
             self.metrics.cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(cached);
@@ -668,7 +772,6 @@ impl HistoricalSwapLoader {
         // Special handling for WETH - it's the base currency, not priced against stablecoins
         if token == chain_config.weth_address {
             debug!("Token is WETH, attempting to get ETH/USD price via multiple methods");
-            visited_tokens.remove(&token);
 
             // Method 1: Try multi-hop resolution first
             if let Ok(Some(multi_hop_price)) = self.get_token_price_via_intermediary(
@@ -677,6 +780,7 @@ impl HistoricalSwapLoader {
                 debug!("Using multi-hop ETH price: ${} for WETH at block {}",
                       multi_hop_price.price, block_number);
                 self.price_cache.insert(cache_key, Some(multi_hop_price.clone())).await;
+                visited_tokens.remove(&token);
                 return Ok(Some(multi_hop_price));
             }
 
@@ -694,11 +798,13 @@ impl HistoricalSwapLoader {
                     });
                     debug!("Using direct ETH price fallback: ${} for WETH at block {}", price, block_number);
                     self.price_cache.insert(cache_key, result.clone()).await;
+                    visited_tokens.remove(&token);
                     return Ok(result);
                 },
                 _ => {
                     debug!("Could not get ETH price via any method for WETH at block {}", block_number);
                     self.price_cache.insert(cache_key, None).await;
+                    visited_tokens.remove(&token);
                     return Ok(None);
                 }
             }
@@ -728,13 +834,13 @@ impl HistoricalSwapLoader {
         let stablecoin_bytes: Vec<&[u8]> = stablecoins.iter().map(|s| s.as_bytes()).collect();
         
         // Get network_id from chain_name
-        let network_id = self.normalize_network_id(chain_name);
+        let aliases = self.chain_aliases(chain_name);
         
         // Query for swaps where token is paired with any stablecoin (both directions)
         // Add lookback window to prevent using stale data using per-chain config
         let lookback_blocks: i64 = self.chain_config
             .chains
-            .get(chain_name)
+            .get(&cfg_key)
             .and_then(|c| c.price_lookback_blocks)
             .map(|v| v as i64)
             .unwrap_or(1000);
@@ -747,13 +853,13 @@ impl HistoricalSwapLoader {
                 price_t0_in_t1,
                 price_t1_in_t0
             FROM swaps
-            WHERE LOWER(network_id) = $1
+            WHERE LOWER(network_id) = ANY($1::text[])
                 AND block_number <= $2
                 AND block_number > ($2 - $5)
                 AND (
-                    (token0_address = $3 AND token1_address = ANY($4))
+                    (token0_address = $3 AND token1_address = ANY($4::bytea[]))
                     OR
-                    (token1_address = $3 AND token0_address = ANY($4))
+                    (token1_address = $3 AND token0_address = ANY($4::bytea[]))
                 )
             ORDER BY block_number DESC, log_index DESC
             LIMIT 10
@@ -762,42 +868,37 @@ impl HistoricalSwapLoader {
         debug!("Executing stablecoin price query for token {:?} on chain {} at block {} with {} stablecoins", 
                token, chain_name, block_number, stablecoins.len());
         
-        let row_opt = conn.query(
+        let rows = conn.query(
             query,
-            &[&network_id, &(block_number as i64), &token_bytes, &stablecoin_bytes, &lookback_blocks]
-        ).await.map_err(|e| anyhow!("Database query failed: {}", e))?
-        .into_iter()
-        .next();
-        
-        debug!("Stablecoin query result: {:?}", row_opt.is_some());
-        
-        let result = if let Some(row) = row_opt {
-            let token0_bytes: Vec<u8> = row.get("token0_address");
-            let token1_bytes: Vec<u8> = row.get("token1_address");
-            let token0 = Address::from_slice(&token0_bytes);
-            let token1 = Address::from_slice(&token1_bytes);
-            let price_in_stablecoin = if token == token0 {
-                row.get::<_, Option<rust_decimal::Decimal>>("price_t0_in_t1")
-                    .and_then(|d| d.to_f64()).unwrap_or(0.0)
-            } else if token == token1 {
-                row.get::<_, Option<rust_decimal::Decimal>>("price_t1_in_t0")
-                    .and_then(|d| d.to_f64()).unwrap_or(0.0)
-            } else {
-                0.0
-            };
-            
-            debug!("Found stablecoin price for token {:?}: {} (token0={:?}, token1={:?})", 
-                   token, price_in_stablecoin, token0, token1);
-            
-            if price_in_stablecoin > 0.0 {
-                let unix_ts: Option<i64> = row.get("unix_ts");
-                Some(PriceData {
-                    price: price_in_stablecoin,
-                    block_number,
-                    token_address: token,
-                    unix_ts: unix_ts.unwrap_or(0) as u64,
-                    source: crate::types::PriceSource::DerivedFromSwaps,
-                })
+            &[&aliases, &(block_number as i64), &token_bytes, &stablecoin_bytes, &lookback_blocks]
+        ).await.map_err(|e| anyhow!("Database query failed: {}", e))?;
+
+        debug!("Stablecoin query result: {} rows", rows.len());
+
+        let result = if !rows.is_empty() {
+            // Compute median price across up to 10 recent rows
+            let mut prices: Vec<(f64, u64)> = Vec::new();
+            for row in &rows {
+                let token0_bytes: Vec<u8> = row.try_get("token0_address").ok().unwrap_or_default();
+                let token1_bytes: Vec<u8> = row.try_get("token1_address").ok().unwrap_or_default();
+                let token0 = Address::from_slice(&token0_bytes);
+                let token1 = Address::from_slice(&token1_bytes);
+                let price_opt: Option<f64> = if token == token0 {
+                    row.get::<_, Option<rust_decimal::Decimal>>("price_t0_in_t1").and_then(|d| d.to_f64())
+                } else if token == token1 {
+                    row.get::<_, Option<rust_decimal::Decimal>>("price_t1_in_t0").and_then(|d| d.to_f64())
+                } else { None };
+                if let Some(p) = price_opt { if p > 0.0 { 
+                    let unix_ts: Option<i64> = row.try_get("unix_ts").ok().flatten();
+                    prices.push((p, unix_ts.unwrap_or(0) as u64));
+                }}
+            }
+            if !prices.is_empty() {
+                prices.sort_by(|a,b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                let mid = prices.len()/2;
+                let (median_price, median_ts) = if prices.len()%2==0 { ((prices[mid-1].0+prices[mid].0)/2.0, prices[mid].1) } else { prices[mid] };
+                debug!("Stablecoin median price for token {:?}: {} from {} rows", token, median_price, prices.len());
+                Some(PriceData { price: median_price, block_number, token_address: token, unix_ts: median_ts, source: crate::types::PriceSource::DerivedFromSwaps })
             } else {
                 debug!("Stablecoin price is 0, trying WETH fallback");
                 // Try to find price through major tokens (WETH, etc.)
@@ -814,7 +915,7 @@ impl HistoricalSwapLoader {
                         price_t0_in_t1,
                         price_t1_in_t0
                     FROM swaps
-                    WHERE LOWER(network_id) = $1
+                    WHERE LOWER(network_id) = ANY($1::text[])
                         AND block_number <= $2
                         AND block_number > ($2 - $5)
                         AND (
@@ -830,7 +931,7 @@ impl HistoricalSwapLoader {
                 
                 let major_row_opt = conn.query(
                     major_query,
-                    &[&network_id, &(block_number as i64), &token_bytes, &weth.as_bytes(), &lookback_blocks]
+                    &[&aliases, &(block_number as i64), &token_bytes, &weth.as_bytes(), &lookback_blocks]
                 ).await.map_err(|e| anyhow!("Database query failed: {}", e))?
                 .into_iter()
                 .next();
@@ -838,8 +939,8 @@ impl HistoricalSwapLoader {
                 debug!("WETH fallback query result: {:?}", major_row_opt.is_some());
                 
                 if let Some(major_row) = major_row_opt {
-                    let token0_bytes: Vec<u8> = major_row.get("token0_address");
-                    let token1_bytes: Vec<u8> = major_row.get("token1_address");
+                    let token0_bytes: Vec<u8> = major_row.try_get("token0_address").ok().unwrap_or_default();
+                    let token1_bytes: Vec<u8> = major_row.try_get("token1_address").ok().unwrap_or_default();
                     let token0 = Address::from_slice(&token0_bytes);
                     let token1 = Address::from_slice(&token1_bytes);
                     let price_in_major = if token == token0 {
@@ -876,7 +977,7 @@ impl HistoricalSwapLoader {
                                             token0_address,
                                             token1_address
                                         FROM swaps
-                                        WHERE LOWER(network_id) = $1
+                                        WHERE LOWER(network_id) = ANY($1::text[])
                                             AND block_number <= $2
                                             AND block_number > ($2 - 1000)
                                             AND (
@@ -887,10 +988,10 @@ impl HistoricalSwapLoader {
                                         ORDER BY block_number DESC, log_index DESC
                                         LIMIT 1
                                     "#,
-                                    &[&network_id, &(block_number as i64), &weth.as_bytes(), &stable.as_bytes()]
+                                    &[&aliases, &(block_number as i64), &weth.as_bytes(), &stable.as_bytes()]
                                 ).await?.into_iter().next() {
-                                    let t0: Vec<u8> = stable_row.get("token0_address");
-                                    let t1: Vec<u8> = stable_row.get("token1_address");
+                            let t0: Vec<u8> = stable_row.try_get("token0_address").ok().unwrap_or_default();
+                            let t1: Vec<u8> = stable_row.try_get("token1_address").ok().unwrap_or_default();
                                     let t0_addr = Address::from_slice(&t0);
                                     let t1_addr = Address::from_slice(&t1);
                                     let price = if weth == t0_addr {
@@ -926,7 +1027,7 @@ impl HistoricalSwapLoader {
                         };
 
                         if major_token_price > 0.0 {
-                            let unix_ts: Option<i64> = major_row.get("unix_ts");
+                    let unix_ts: Option<i64> = major_row.try_get("unix_ts").ok().flatten();
                             debug!("Final calculated price for token {:?}: {} (WETH price: {})", 
                                    token, price_in_major * major_token_price, major_token_price);
                             Some(PriceData {
@@ -961,12 +1062,12 @@ impl HistoricalSwapLoader {
                 if chain_config.backtest_use_external_price_apis.unwrap_or(false) {
                     debug!("All database price resolution failed, trying external API fallback for token {:?} at block {}", token, block_number);
 
-                    if let Ok(timestamp) = self.get_timestamp_at_block(chain_name, block_number).await {
+            if let Ok(timestamp) = self.get_timestamp_at_block(chain_name, block_number).await {
                         // For WETH, try to get ETH price from CoinGecko
                         if token == chain_config.weth_address {
                             if let Some(eth_price) = self.get_coingecko_historical_price(timestamp).await {
                                 debug!("Found WETH price from CoinGecko: ${:.2}", eth_price);
-                                Some(crate::swap_loader::PriceData {
+                        Some(PriceData {
                                     price: eth_price,
                                     block_number,
                                     token_address: token,
@@ -1070,8 +1171,7 @@ impl HistoricalSwapLoader {
     /// Fallback method to get ETH price when WETH pricing fails
     async fn get_eth_price_fallback(&self, chain_name: &str, block_number: u64) -> Option<f64> {
         debug!("Attempting ETH price fallback for chain {} at block {}", chain_name, block_number);
-
-        let network_id = self.normalize_network_id(chain_name);
+        // Build aliases on demand in query param lists to avoid unused warnings
 
         // Method 1: Try to get ETH/USD price from a major stablecoin pair (e.g., USDC-WETH)
         if let Some(chain_config) = self.chain_config.chains.get(chain_name) {
@@ -1092,7 +1192,7 @@ impl HistoricalSwapLoader {
                             price_t1_in_t0,  -- WETH per stablecoin
                             unix_ts
                         FROM swaps
-                        WHERE LOWER(network_id) = $1
+                        WHERE LOWER(network_id) = ANY($1::text[])
                             AND block_number <= $2
                             AND block_number > ($2 - $5)
                             AND token0_address = $3  -- stablecoin
@@ -1104,8 +1204,9 @@ impl HistoricalSwapLoader {
                     let block_number_i64 = block_number as i64;
                     let stablecoin_bytes = stablecoin.as_bytes();
                     let weth_bytes = chain_config.weth_address.as_bytes();
+                    let aliases = self.chain_aliases(chain_name);
                     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
-                        &network_id,
+                        &aliases,
                         &block_number_i64,
                         &stablecoin_bytes,
                         &weth_bytes,
@@ -1136,7 +1237,7 @@ impl HistoricalSwapLoader {
                             price_t0_in_t1,  -- stablecoin per WETH
                             unix_ts
                         FROM swaps
-                        WHERE LOWER(network_id) = $1
+                        WHERE LOWER(network_id) = ANY($1::text[])
                             AND block_number <= $2
                             AND block_number > ($2 - $5)
                             AND token0_address = $3  -- WETH
@@ -1149,7 +1250,7 @@ impl HistoricalSwapLoader {
                     let reverse_stablecoin_bytes = stablecoin.as_bytes();
                     let reverse_weth_bytes = chain_config.weth_address.as_bytes();
                     let reverse_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
-                        &network_id,
+                        &aliases,
                         &reverse_block_number_i64,
                         &reverse_weth_bytes,
                         &reverse_stablecoin_bytes,
@@ -1282,12 +1383,12 @@ impl HistoricalSwapLoader {
         let swaps_query = r#"
             SELECT unix_ts
             FROM swaps
-            WHERE LOWER(network_id) = $1 AND block_number = $2 AND unix_ts IS NOT NULL
+            WHERE LOWER(network_id) = ANY($1::text[]) AND block_number = $2 AND unix_ts IS NOT NULL
             LIMIT 1
         "#;
-        match conn.query_opt(swaps_query, &[&network_id, &(block_number as i64)]).await {
+        match conn.query_opt(swaps_query, &[&aliases, &(block_number as i64)]).await {
             Ok(Some(row)) => {
-                let ts: Option<i64> = row.get("unix_ts");
+            let ts: Option<i64> = row.try_get("unix_ts").ok().flatten();
                 if let Some(ts) = ts {
                     debug!("Found timestamp {} for block {} in swaps table", ts, block_number);
                     return Some(ts as u64);
@@ -1298,7 +1399,7 @@ impl HistoricalSwapLoader {
         }
 
         // Try to find timestamp from nearby blocks using the efficient method
-        if let Ok(Some(ts)) = self.find_nearest_block_timestamp(&conn, &network_id, block_number, chain_name).await {
+        if let Ok(Some(ts)) = self.find_nearest_block_timestamp(&conn, &aliases, block_number, chain_name).await {
             return Some(ts);
         }
 
@@ -1309,14 +1410,14 @@ impl HistoricalSwapLoader {
         let any_block_query = "
             SELECT block_number, unix_ts
             FROM swaps
-            WHERE LOWER(network_id) = $1
+            WHERE LOWER(network_id) = ANY($1::text[])
                 AND unix_ts IS NOT NULL
             ORDER BY ABS(block_number - $2) ASC
             LIMIT 1";
 
-        if let Ok(row) = conn.query_one(any_block_query, &[&network_id, &(block_number as i64)]).await {
-            let found_block: i64 = row.get("block_number");
-            let found_ts: i64 = row.get("unix_ts");
+        if let Ok(row) = conn.query_one(any_block_query, &[&aliases, &(block_number as i64)]).await {
+            let found_block: i64 = row.try_get("block_number").ok().unwrap_or(0);
+            let found_ts: i64 = row.try_get("unix_ts").ok().unwrap_or(0);
             let block_diff = block_number as i64 - found_block;
 
             // Use chain-specific average block time
@@ -1333,15 +1434,15 @@ impl HistoricalSwapLoader {
             let most_recent_query = "
                 SELECT unix_ts, block_number
                 FROM swaps
-                WHERE LOWER(network_id) = $1
+                WHERE LOWER(network_id) = ANY($1::text[])
                     AND unix_ts IS NOT NULL
                 ORDER BY block_number DESC
                 LIMIT 1";
 
-            match conn.query_one(most_recent_query, &[&network_id]).await {
+            match conn.query_one(most_recent_query, &[&aliases]).await {
                 Ok(row) => {
-                    let last_ts: i64 = row.get("unix_ts");
-                    let last_block: i64 = row.get("block_number");
+                    let last_ts: i64 = row.try_get("unix_ts").ok().unwrap_or(0);
+                    let last_block: i64 = row.try_get("block_number").ok().unwrap_or(0);
                     let block_diff = block_number as i64 - last_block;
 
                     // Use chain-specific average block time
@@ -1365,7 +1466,7 @@ impl HistoricalSwapLoader {
     /// Get historical ETH price from CoinGecko
     async fn get_coingecko_historical_price(&self, timestamp: u64) -> Option<f64> {
         // Convert timestamp to date string (YYYY-MM-DD)
-        let dt = DateTime::<Utc>::from_timestamp(timestamp as i64, 0)?;
+        let dt = Utc.timestamp_opt(timestamp as i64, 0).single()?;
         let date_str = dt.format("%d-%m-%Y").to_string();
 
         let url = format!("https://api.coingecko.com/api/v3/coins/ethereum/history?date={}", date_str);
@@ -1421,9 +1522,9 @@ impl HistoricalSwapLoader {
 
         match self.http_get_json(&url).await {
             Some(json) => {
-                // Navigate the JSON structure: coins.ethereum.price
+                // Navigate the JSON structure: coins["coingecko:ethereum"].price
                 if let Some(coins) = json.get("coins") {
-                    if let Some(eth_data) = coins.get("ethereum") {
+                    if let Some(eth_data) = coins.get("coingecko:ethereum") {
                         if let Some(price) = eth_data.get("price") {
                             if let Some(price_f64) = price.as_f64() {
                                 return Some(price_f64);
@@ -1439,15 +1540,7 @@ impl HistoricalSwapLoader {
 
     /// Helper function to make HTTP GET requests and parse JSON
     async fn http_get_json(&self, url: &str) -> Option<serde_json::Value> {
-        use reqwest::Client;
-
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent("historical-swap-loader/1.0")
-            .build()
-            .ok()?;
-
-        match client.get(url).send().await {
+        match self.http_client.get(url).send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     match response.json::<serde_json::Value>().await {
@@ -1498,22 +1591,29 @@ impl HistoricalSwapLoader {
             return Ok(results);
         }
         
-        // Batch query for all missing blocks at once
-        if blocks_to_query.len() <= 10 {
-            // For small batches, use individual queries (existing behavior)
+        // Check if token_prices table should be used
+        if !self.chain_config.chains.get(chain_name)
+            .and_then(|c| c.use_token_prices_table)
+            .unwrap_or(false) {
+            // Fall back to per-token resolution when token_prices table is not available
+            if !TOKEN_PRICES_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+                warn!("token_prices path disabled for chain {}, falling back to per-token resolution", chain_name);
+            } else {
+                debug!("token_prices fallback already warned once; suppressing repeated logs");
+            }
             for &block in &blocks_to_query {
                 if let Some(price_data) = self.get_token_price_data_at_block(chain_name, token, block).await? {
                     results.insert(block, price_data);
                 }
             }
-        } else {
-            // For larger batches, fall back to individual queries since token_prices table doesn't exist
-            // This is less efficient but maintains compatibility
-            warn!("token_prices table not available, falling back to individual price queries for batch request");
-            for &block in &blocks_to_query {
-                if let Some(price_data) = self.get_token_price_data_at_block(chain_name, token, block).await? {
-                    results.insert(block, price_data);
-                }
+            return Ok(results);
+        }
+
+        // For larger batches, fall back to individual queries since token_prices table doesn't exist
+        // This is less efficient but maintains compatibility
+        for &block in &blocks_to_query {
+            if let Some(price_data) = self.get_token_price_data_at_block(chain_name, token, block).await? {
+                results.insert(block, price_data);
             }
         }
         
@@ -1524,6 +1624,7 @@ impl HistoricalSwapLoader {
     #[instrument(level = "trace", skip(self))]
     async fn load_v3_tick_data_for_pool(
         &self,
+        chain_name: &str,
         pool_address: Address,
         block_number: u64,
     ) -> Result<Option<std::collections::HashMap<i32, TickData>>> {
@@ -1531,6 +1632,7 @@ impl HistoricalSwapLoader {
             .map_err(|e| anyhow!("Failed to get database connection: {}", e))?;
 
         let pool_bytes = pool_address.as_bytes();
+        let aliases = self.chain_aliases(chain_name);
 
         // Query for tick data at or before the specified block
         let rows = conn.query(
@@ -1541,10 +1643,11 @@ impl HistoricalSwapLoader {
                 liquidity_gross
             FROM v3_ticks
             WHERE pool_address = $1
-              AND block_number <= $2
+              AND LOWER(chain_name) = ANY($2::text[])
+              AND block_number <= $3
             ORDER BY block_number DESC, tick
             "#,
-            &[&pool_bytes, &(block_number as i64)]
+            &[&pool_bytes, &aliases, &(block_number as i64)]
         ).await.map_err(|e| anyhow!("Failed to query V3 tick data: {}", e))?;
 
         if rows.is_empty() {
@@ -1553,9 +1656,9 @@ impl HistoricalSwapLoader {
 
         let mut tick_data = std::collections::HashMap::new();
         for row in rows {
-            let tick: i32 = row.get("tick");
-            let liquidity_net: i64 = row.get("liquidity_net");
-            let liquidity_gross: i64 = row.get("liquidity_gross");
+            let tick: i32 = row.try_get("tick").ok().unwrap_or(0);
+            let liquidity_net: i64 = row.try_get("liquidity_net").ok().unwrap_or(0);
+            let liquidity_gross: i64 = row.try_get("liquidity_gross").ok().unwrap_or(0);
 
             tick_data.insert(tick, TickData {
                 liquidity_gross: liquidity_gross as u128,
@@ -1604,7 +1707,11 @@ impl HistoricalSwapLoader {
                 .and_then(|c| c.use_token_prices_table)
                 .unwrap_or(false) {
                 // Fall back to per-token resolution when token_prices table is not available
-                warn!("token_prices table not available for chain {}, falling back to individual price queries", chain_name);
+                if !TOKEN_PRICES_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+                    warn!("token_prices table not available for chain {}, falling back to individual price queries", chain_name);
+                } else {
+                    debug!("token_prices fallback already warned once; suppressing repeated logs");
+                }
                 for &token in &uncached_tokens {
                     if let Some(price_data) = self.get_token_price_data_at_block(chain_name, token, block_number).await? {
                         results.insert(token, price_data.price);
@@ -1630,14 +1737,15 @@ impl HistoricalSwapLoader {
                     volume_24h,
                     unix_ts
                 FROM token_prices
-                WHERE LOWER(chain_name) = $1
+                WHERE LOWER(chain_name) = ANY($1::text[])
                     AND block_number <= $2
                     AND token_address = ANY($3::bytea[])
                 ORDER BY token_address, block_number DESC
             "#;
 
             // Execute batch query with proper parameters
-            let rows = conn.query(query, &[&chain_name, &(block_number as i64), &token_bytes]).await
+            let aliases = self.chain_aliases(chain_name);
+            let rows = conn.query(query, &[&aliases, &(block_number as i64), &token_bytes]).await
                 .map_err(|e| anyhow!("Failed to query token prices: {}", e))?;
 
             self.metrics.queries_executed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1702,23 +1810,24 @@ impl HistoricalSwapLoader {
         let query = "
             SELECT price_usd
             FROM token_prices
-            WHERE chain_name = $1
+            WHERE LOWER(chain_name) = ANY($1::text[])
                 AND token_address = $2
-                AND block_number 
+                AND block_number
                     BETWEEN $3 AND $4
             ORDER BY ABS(block_number - $5) ASC
             LIMIT 1
         ";
-        
+
         let start_block = target_block.saturating_sub(max_distance) as i64;
         // In strict mode, do not look ahead into future blocks
         let end_block = if strict { target_block as i64 } else { (target_block + max_distance) as i64 };
         let target_block_i64 = target_block as i64;
         let token_bytes = token.as_bytes().to_vec();
-        
+        let aliases = self.chain_aliases(chain_name);
+
         let row = conn.query_opt(
             query,
-            &[&chain_name, &token_bytes, &start_block, &end_block, &target_block_i64]
+            &[&aliases, &token_bytes, &start_block, &end_block, &target_block_i64]
         ).await.ok()??;
         
         row.get::<_, Option<f64>>(0)
@@ -1762,7 +1871,9 @@ impl HistoricalSwapLoader {
         self.metrics.cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         
         // Validate chain configuration and get network_id
-        let chain_config = self.chain_config.chains.get(chain_name)
+        let cfg_key = self.normalize_network_id(chain_name);
+        let chain_config = self.chain_config.chains.get(&cfg_key)
+            .or_else(|| self.chain_config.chains.get(chain_name))
             .ok_or_else(|| anyhow!("Chain '{}' not found in configuration", chain_name))?;
         
         let conn = self.db_pool.get().await
@@ -1777,7 +1888,7 @@ impl HistoricalSwapLoader {
                 AVG(tx_max_priority_fee_per_gas) as avg_max_priority_fee,
                 COUNT(*) as tx_count
             FROM swaps
-            WHERE LOWER(network_id) = $1 
+            WHERE LOWER(network_id) = ANY($1::text[])
                 AND block_number = $2
                 AND (
                     tx_gas_price IS NOT NULL 
@@ -1786,14 +1897,15 @@ impl HistoricalSwapLoader {
                 )
         "#;
         
-        let row_result = conn.query_opt(query, &[&normalized_chain, &block_number]).await
+        let aliases = self.chain_aliases(chain_name);
+        let row_result = conn.query_opt(query, &[&aliases, &block_number]).await
             .map_err(|e| anyhow!("Database query failed: {}", e))?;
         
         let (avg_gas_price, avg_max_fee, avg_max_priority_fee, tx_count) = if let Some(row) = row_result {
-            let avg_gas_price: Option<Decimal> = row.get("avg_gas_price");
-            let avg_max_fee: Option<Decimal> = row.get("avg_max_fee");
-            let avg_max_priority_fee: Option<Decimal> = row.get("avg_max_priority_fee");
-            let tx_count: i64 = row.get("tx_count");
+            let avg_gas_price: Option<Decimal> = row.try_get("avg_gas_price").ok().flatten();
+            let avg_max_fee: Option<Decimal> = row.try_get("avg_max_fee").ok().flatten();
+            let avg_max_priority_fee: Option<Decimal> = row.try_get("avg_max_priority_fee").ok().flatten();
+            let tx_count: i64 = row.try_get("tx_count").ok().unwrap_or(0);
             (avg_gas_price, avg_max_fee, avg_max_priority_fee, tx_count)
         } else {
             (None, None, None, 0)
@@ -1811,12 +1923,10 @@ impl HistoricalSwapLoader {
         
         let gas_price = if let Some(max_fee) = avg_max_fee {
             // EIP-1559 transaction without explicit base fee
-            let max_fee_u256 = U256::from(max_fee.to_u128().unwrap_or(20_000_000_000));
-            let priority_fee_u256 = U256::from(
-                avg_max_priority_fee
-                    .and_then(|p| p.to_u128())
-                    .unwrap_or(2_000_000_000)
-            );
+            let max_fee_u256 = self.decimal_to_u256_safe(max_fee, U256::from(20_000_000_000u64));
+            let priority_fee_u256 = avg_max_priority_fee
+                .map(|p| self.decimal_to_u256_safe(p, U256::from(2_000_000_000u64)))
+                .unwrap_or(U256::from(2_000_000_000u64));
             
             // For EIP-1559 transactions, estimate base fee from max fee and priority fee
             let estimated_base_fee = if max_fee_u256 > priority_fee_u256 {
@@ -1840,7 +1950,7 @@ impl HistoricalSwapLoader {
             }
         } else if let Some(gas_price) = avg_gas_price {
             // Legacy gas price
-            let price = U256::from(gas_price.to_u128().unwrap_or(20_000_000_000));
+            let price = self.decimal_to_u256_safe(gas_price, U256::from(20_000_000_000u64));
             let clamped_price = if price > max_gas_price { max_gas_price } else { price };
             GasPrice {
                 base_fee: clamped_price,
@@ -1935,7 +2045,7 @@ impl HistoricalSwapLoader {
                 AVG(tx_max_priority_fee_per_gas) as avg_max_priority_fee,
                 COUNT(*) as tx_count
             FROM swaps
-            WHERE LOWER(network_id) = $1 
+            WHERE LOWER(network_id) = ANY($1::text[])
                 AND block_number = $2
                 AND (
                     tx_gas_price IS NOT NULL 
@@ -1944,14 +2054,15 @@ impl HistoricalSwapLoader {
                 )
         "#;
         
-        let row_result = conn.query_opt(query, &[&normalized_chain, &block_number]).await
+        let aliases = self.chain_aliases(chain_name);
+        let row_result = conn.query_opt(query, &[&aliases, &block_number]).await
             .map_err(|e| anyhow!("Database query failed: {}", e))?;
         
         if let Some(row) = row_result {
-            let avg_gas_price: Option<Decimal> = row.get("avg_gas_price");
-            let avg_max_fee: Option<Decimal> = row.get("avg_max_fee");
-            let avg_max_priority_fee: Option<Decimal> = row.get("avg_max_priority_fee");
-            let tx_count: i64 = row.get("tx_count");
+            let avg_gas_price: Option<Decimal> = row.try_get("avg_gas_price").ok().flatten();
+            let avg_max_fee: Option<Decimal> = row.try_get("avg_max_fee").ok().flatten();
+            let avg_max_priority_fee: Option<Decimal> = row.try_get("avg_max_priority_fee").ok().flatten();
+            let tx_count: i64 = row.try_get("tx_count").ok().unwrap_or(0);
             
             if tx_count > 0 {
                 let chain_config = self.chain_config.chains.get(chain_name)
@@ -1962,27 +2073,10 @@ impl HistoricalSwapLoader {
                 
                 let gas_price = if let Some(max_fee) = avg_max_fee {
                     // EIP-1559 transaction without explicit base fee
-                    // Ensure proper conversion from Decimal to U256 (assuming values are in wei)
-                    let max_fee_u256 = max_fee.to_u128()
-                        .and_then(|v| {
-                            // Check for overflow before converting
-                            if v <= u128::MAX {
-                                Some(U256::from(v))
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_else(|| U256::from(20_000_000_000u64));
+                    let max_fee_u256 = self.decimal_to_u256_safe(max_fee, U256::from(20_000_000_000u64));
                     
                     let priority_fee_u256 = avg_max_priority_fee
-                        .and_then(|p| p.to_u128())
-                        .and_then(|v| {
-                            if v <= u128::MAX {
-                                Some(U256::from(v))
-                            } else {
-                                None
-                            }
-                        })
+                        .map(|p| self.decimal_to_u256_safe(p, U256::from(2_000_000_000u64)))
                         .unwrap_or_else(|| U256::from(2_000_000_000u64));
                     
                     // For EIP-1559 transactions, estimate base fee from max fee and priority fee
@@ -2006,16 +2100,8 @@ impl HistoricalSwapLoader {
                         }
                     }
                 } else if let Some(gas_price) = avg_gas_price {
-                    // Safe conversion with overflow check
-                    let price = gas_price.to_u128()
-                        .and_then(|v| {
-                            if v <= u128::MAX {
-                                Some(U256::from(v))
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_else(|| U256::from(20_000_000_000u64));
+                    // Safe conversion using Decimal->string->U256
+                    let price = self.decimal_to_u256_safe(gas_price, U256::from(20_000_000_000u64));
                     let clamped_price = if price > max_gas_price { max_gas_price } else { price };
                     GasPrice {
                         base_fee: clamped_price,
@@ -2106,16 +2192,16 @@ impl HistoricalSwapLoader {
     async fn find_nearest_block_timestamp(
         &self,
         conn: &tokio_postgres::Client,
-        network_id: &str,
+        aliases: &[String],
         target_block: u64,
         chain_name: &str,
     ) -> Result<Option<u64>> {
         const MAX_DISTANCE: i64 = 10000;
-        
+
         let query = r#"
             SELECT block_number, unix_ts
             FROM swaps
-            WHERE LOWER(network_id) = $1
+            WHERE LOWER(network_id) = ANY($1::text[])
                 AND block_number BETWEEN $2 AND $3
                 AND unix_ts IS NOT NULL
             ORDER BY ABS(block_number - $4) ASC
@@ -2128,17 +2214,17 @@ impl HistoricalSwapLoader {
 
         debug!("Searching for timestamp within {} blocks of block {} (range: {} to {})",
                MAX_DISTANCE, target_block, min_block, max_block);
-        
+
         let row_opt = conn.query_opt(
             query,
-            &[&network_id, &min_block, &max_block, &target_block_i64]
+            &[&aliases, &min_block, &max_block, &target_block_i64]
         ).await.map_err(|e| anyhow!("Failed to find nearest timestamp: {}", e))?;
 
         debug!("Query result for block {}: found={}", target_block, row_opt.is_some());
         
         if let Some(row) = row_opt {
-            let unix_ts: i64 = row.get("unix_ts");
-            let found_block: i64 = row.get("block_number");
+        let unix_ts: i64 = row.try_get("unix_ts").ok().unwrap_or(0);
+        let found_block: i64 = row.try_get("block_number").ok().unwrap_or(0);
             let block_diff = (found_block - target_block_i64).abs();
             
             // Estimate timestamp based on the found block and average block time
@@ -2176,7 +2262,9 @@ impl HistoricalSwapLoader {
         debug!("Loading swaps for chain: {}, blocks: {}-{}", chain_name, start_block, end_block);
         
         // Validate chain configuration and apply query optimizations
-        let chain_config = self.chain_config.chains.get(chain_name)
+        let cfg_key = self.normalize_network_id(chain_name);
+        let chain_config = self.chain_config.chains.get(&cfg_key)
+            .or_else(|| self.chain_config.chains.get(chain_name))
             .ok_or_else(|| anyhow!("Chain '{}' not found in configuration", chain_name))?;
         
         let conn = self.db_pool.get().await
@@ -2213,9 +2301,10 @@ impl HistoricalSwapLoader {
             FROM swaps 
             WHERE LOWER(network_id) = ANY($1::text[]) AND block_number BETWEEN $2 AND $3
                 AND (
-                    (amount0_in > 0 AND amount1_out > 0) OR 
+                    (amount0_in > 0 AND amount1_out > 0) OR
                     (amount1_in > 0 AND amount0_out > 0) OR
-                    (v3_amount0 IS NOT NULL OR v3_amount1 IS NOT NULL)
+                    (v3_amount0 IS NOT NULL OR v3_amount1 IS NOT NULL) OR
+                    (tokens_sold IS NOT NULL OR tokens_bought IS NOT NULL)
                 )
             ORDER BY block_number, log_index{}
             "#,
@@ -2279,11 +2368,14 @@ impl HistoricalSwapLoader {
             anyhow::anyhow!("pool_address column not found or invalid")
         })?;
 
-        // Safety check for V4 pools (32 bytes) vs regular EVM addresses (20 bytes)
-        if pool_address_bytes.len() != 20 {
+        let normalized_pool_address = if pool_address_bytes.len() == 20 {
+            Address::from_slice(&pool_address_bytes)
+        } else if pool_address_bytes.len() == 32 {
+            Address::from_slice(&pool_address_bytes[12..])
+        } else {
             warn!("Unsupported pool address length: {}, skipping. Pool address bytes: {:?}", pool_address_bytes.len(), pool_address_bytes);
             return Err(anyhow!("unsupported pool_address length: {}", pool_address_bytes.len()));
-        }
+        };
 
         // Handle token addresses - check if they exist
         let token0_bytes: Option<Vec<u8>> = if let Ok(bytes) = row.try_get("token0_address") {
@@ -2627,8 +2719,16 @@ impl HistoricalSwapLoader {
         let token0_addr = token0_bytes.map(|bytes| Address::from_slice(&bytes)).unwrap_or(Address::zero());
         let token1_addr = token1_bytes.map(|bytes| Address::from_slice(&bytes)).unwrap_or(Address::zero());
 
+        let pool_address = if pool_address_bytes.len() == 20 {
+            Address::from_slice(&pool_address_bytes)
+        } else if pool_address_bytes.len() == 32 {
+            Address::from_slice(&pool_address_bytes[12..])
+        } else {
+            return Err(anyhow!("unsupported pool_address length: {}", pool_address_bytes.len()));
+        };
+
         Ok(PoolStateFromSwaps {
-            pool_address: Address::from_slice(&pool_address_bytes),
+            pool_address,
             token0: token0_addr,
             token1: token1_addr,
             token0_decimals: token0_decimals_final,
@@ -2639,8 +2739,8 @@ impl HistoricalSwapLoader {
             protocol_type: self.convert_dex_protocol_to_protocol_type(&protocol),
             timestamp: row.try_get::<_, Option<i64>>("unix_ts").ok().flatten().unwrap_or(0) as u64,
             block_number: row.try_get::<_, i64>("block_number").ok().unwrap_or(0) as u64,
-            sqrt_price_x96: sqrt_price_x96.and_then(|d| d.to_u128().map(U256::from)),
-            liquidity: liquidity.and_then(|d| d.to_u128().map(U256::from)),
+            sqrt_price_x96: sqrt_price_x96.map(|d| self.decimal_to_u256_safe(d, U256::zero())),
+            liquidity: liquidity.map(|d| self.decimal_to_u256_safe(d, U256::zero())),
             tick: tick,
             v3_tick_data: None, // Load lazily when needed for V3 calculations
             v3_tick_current: tick, // Use the tick as current tick
@@ -2683,10 +2783,14 @@ impl HistoricalSwapLoader {
         })?;
 
         // Safety check for V4 pools (32 bytes) vs regular EVM addresses (20 bytes)
-        if pool_address_bytes.len() != 20 {
-            warn!("Unsupported pool address length: {}, skipping. Pool address bytes: {:?}", pool_address_bytes.len(), pool_address_bytes);
-            return Err(anyhow!("unsupported pool_address length: {}", pool_address_bytes.len()));
-        }
+        let normalized_pool_address = match pool_address_bytes.len() {
+            20 => Address::from_slice(&pool_address_bytes),
+            32 => Address::from_slice(&pool_address_bytes[12..]),
+            n => {
+                warn!("Unsupported pool address length: {}, skipping. Pool address bytes: {:?}", n, pool_address_bytes);
+                return Err(anyhow!("unsupported pool_address length: {}", n));
+            }
+        };
 
         let protocol_type: Option<i16> = row.try_get("protocol_type").ok();
         let protocol_type = protocol_type.unwrap_or(1); // Default to UniswapV2
@@ -2857,7 +2961,7 @@ impl HistoricalSwapLoader {
         
         Ok(SwapEvent {
             chain_name: row.try_get("network_id").ok().unwrap_or("unknown".to_string()),
-            pool_address: Address::from_slice(&pool_address_bytes),
+            pool_address: normalized_pool_address,
             tx_hash: H256::from_slice(&transaction_hash_bytes),
             block_number: row.try_get::<_, i64>("block_number").ok().unwrap_or(0) as u64,
             log_index: U256::from((row.try_get::<_, i64>("log_index").ok().unwrap_or(0)).max(0i64) as u64),
@@ -2868,8 +2972,8 @@ impl HistoricalSwapLoader {
             amount_out: amount_out,
             sender,
             recipient,
-            gas_used: gas_used.and_then(|d| d.to_u128().map(U256::from)),
-            effective_gas_price: gas_price.and_then(|d| d.to_u128().map(U256::from)),
+            gas_used: gas_used.map(|d| self.decimal_to_u256_safe(d, U256::zero())),
+            effective_gas_price: gas_price.map(|d| self.decimal_to_u256_safe(d, U256::zero())),
             protocol: protocol.clone(),
             data: swap_data,
             token0,
@@ -2933,6 +3037,11 @@ impl HistoricalSwapLoader {
                 }
             }),
             v3_tick_data: row.try_get::<_, Option<String>>("v3_tick_data").ok().flatten(),
+            price_from_in_usd: None,
+            price_to_in_usd: None,
+            token0_price_usd: None,
+            token1_price_usd: None,
+            pool_liquidity_usd: None,
         })
     }
 
@@ -2953,17 +3062,17 @@ impl HistoricalSwapLoader {
                 // Parse transaction metadata - handle missing columns gracefully
                 let tx_from: Option<Vec<u8>> = row.try_get("tx_from").ok().flatten();
                 let tx_to: Option<Vec<u8>> = row.try_get("tx_to").ok().flatten();
-                
+
                 Ok(SwapData::UniswapV2 {
                     sender: tx_from.map(|bytes| Address::from_slice(&bytes)).unwrap_or(Address::zero()),
                     to: tx_to.map(|bytes| Address::from_slice(&bytes)).unwrap_or(Address::zero()),
-                    amount0_in: amount0_in.and_then(|d| d.to_u128().map(U256::from))
+                    amount0_in: amount0_in.map(|d| self.decimal_to_u256_safe(d, U256::zero()))
                         .unwrap_or(U256::zero()),
-                    amount1_in: amount1_in.and_then(|d| d.to_u128().map(U256::from))
+                    amount1_in: amount1_in.map(|d| self.decimal_to_u256_safe(d, U256::zero()))
                         .unwrap_or(U256::zero()),
-                    amount0_out: amount0_out.and_then(|d| d.to_u128().map(U256::from))
+                    amount0_out: amount0_out.map(|d| self.decimal_to_u256_safe(d, U256::zero()))
                         .unwrap_or(U256::zero()),
-                    amount1_out: amount1_out.and_then(|d| d.to_u128().map(U256::from))
+                    amount1_out: amount1_out.map(|d| self.decimal_to_u256_safe(d, U256::zero()))
                         .unwrap_or(U256::zero()),
                 })
             }
@@ -3024,7 +3133,7 @@ impl HistoricalSwapLoader {
                     recipient,
                     amount0: amount0_i256,
                     amount1: amount1_i256,
-                    sqrt_price_x96: sqrt_price.and_then(|d| d.to_u128().map(U256::from))
+                    sqrt_price_x96: sqrt_price.map(|d| self.decimal_to_u256_safe(d, U256::zero()))
                         .unwrap_or(U256::zero()),
                     liquidity: liquidity.and_then(|d| d.to_u128()).unwrap_or(0),
                     tick: tick.unwrap_or(0),
@@ -3074,9 +3183,9 @@ impl HistoricalSwapLoader {
                     // For Balancer, use the token_in/token_out as our primary tokens
                     // and map to amount0/amount1 based on token ordering
                     let (amount0_in, amount1_in, amount0_out, amount1_out) = {
-                        let amount_in_u256 = amount_in.and_then(|d| d.to_u128().map(U256::from)).unwrap_or(U256::zero());
-                        let amount_out_u256 = amount_out.and_then(|d| d.to_u128().map(U256::from)).unwrap_or(U256::zero());
-                        
+                        let amount_in_u256 = amount_in.map(|d| self.decimal_to_u256_safe(d, U256::zero())).unwrap_or(U256::zero());
+                        let amount_out_u256 = amount_out.map(|d| self.decimal_to_u256_safe(d, U256::zero())).unwrap_or(U256::zero());
+
                         // Map Balancer's direct token_in/token_out to amount0/amount1
                         // We use the token addresses to determine the ordering
                         if token_in_addr < token_out_addr {
@@ -3103,41 +3212,41 @@ impl HistoricalSwapLoader {
                 } else {
                     // Fall back to V2-style parsing using amount0/amount1 fields
                     debug!("Balancer swap missing specific fields, falling back to V2-style parsing");
-                    let amount0_in: Option<Decimal> = row.get("amount0_in");
-                    let amount1_in: Option<Decimal> = row.get("amount1_in");
-                    let amount0_out: Option<Decimal> = row.get("amount0_out");
-                    let amount1_out: Option<Decimal> = row.get("amount1_out");
+                    let amount0_in: Option<Decimal> = row.try_get("amount0_in").ok().flatten();
+                    let amount1_in: Option<Decimal> = row.try_get("amount1_in").ok().flatten();
+                    let amount0_out: Option<Decimal> = row.try_get("amount0_out").ok().flatten();
+                    let amount1_out: Option<Decimal> = row.try_get("amount1_out").ok().flatten();
                     
                     Ok(SwapData::UniswapV2 {
                         sender: tx_from.map(|bytes| Address::from_slice(&bytes)).unwrap_or(Address::zero()),
                         to: tx_to.map(|bytes| Address::from_slice(&bytes)).unwrap_or(Address::zero()),
-                        amount0_in: amount0_in.and_then(|d| d.to_u128().map(U256::from)).unwrap_or(U256::zero()),
-                        amount1_in: amount1_in.and_then(|d| d.to_u128().map(U256::from)).unwrap_or(U256::zero()),
-                        amount0_out: amount0_out.and_then(|d| d.to_u128().map(U256::from)).unwrap_or(U256::zero()),
-                        amount1_out: amount1_out.and_then(|d| d.to_u128().map(U256::from)).unwrap_or(U256::zero()),
+                        amount0_in: amount0_in.map(|d| self.decimal_to_u256_safe(d, U256::zero())).unwrap_or(U256::zero()),
+                        amount1_in: amount1_in.map(|d| self.decimal_to_u256_safe(d, U256::zero())).unwrap_or(U256::zero()),
+                        amount0_out: amount0_out.map(|d| self.decimal_to_u256_safe(d, U256::zero())).unwrap_or(U256::zero()),
+                        amount1_out: amount1_out.map(|d| self.decimal_to_u256_safe(d, U256::zero())).unwrap_or(U256::zero()),
                     })
                 }
             }
             _ => {
                 // For other protocols, fall back to V2 structure with available data
-                let amount0_in: Option<Decimal> = row.get("amount0_in");
-                let amount1_in: Option<Decimal> = row.get("amount1_in");
-                let amount0_out: Option<Decimal> = row.get("amount0_out");
-                let amount1_out: Option<Decimal> = row.get("amount1_out");
+                let amount0_in: Option<Decimal> = row.try_get("amount0_in").ok().flatten();
+                let amount1_in: Option<Decimal> = row.try_get("amount1_in").ok().flatten();
+                let amount0_out: Option<Decimal> = row.try_get("amount0_out").ok().flatten();
+                let amount1_out: Option<Decimal> = row.try_get("amount1_out").ok().flatten();
                 
-                let tx_from: Option<Vec<u8>> = row.get("tx_from");
-                let tx_to: Option<Vec<u8>> = row.get("tx_to");
+                let tx_from: Option<Vec<u8>> = row.try_get("tx_from").ok().flatten();
+                let tx_to: Option<Vec<u8>> = row.try_get("tx_to").ok().flatten();
                 
                 Ok(SwapData::UniswapV2 {
                     sender: tx_from.map(|bytes| Address::from_slice(&bytes)).unwrap_or(Address::zero()),
                     to: tx_to.map(|bytes| Address::from_slice(&bytes)).unwrap_or(Address::zero()),
-                    amount0_in: amount0_in.and_then(|d| d.to_u128().map(U256::from))
+                    amount0_in: amount0_in.map(|d| self.decimal_to_u256_safe(d, U256::zero()))
                         .unwrap_or(U256::zero()),
-                    amount1_in: amount1_in.and_then(|d| d.to_u128().map(U256::from))
+                    amount1_in: amount1_in.map(|d| self.decimal_to_u256_safe(d, U256::zero()))
                         .unwrap_or(U256::zero()),
-                    amount0_out: amount0_out.and_then(|d| d.to_u128().map(U256::from))
+                    amount0_out: amount0_out.map(|d| self.decimal_to_u256_safe(d, U256::zero()))
                         .unwrap_or(U256::zero()),
-                    amount1_out: amount1_out.and_then(|d| d.to_u128().map(U256::from))
+                    amount1_out: amount1_out.map(|d| self.decimal_to_u256_safe(d, U256::zero()))
                         .unwrap_or(U256::zero()),
                 })
             }
@@ -3175,57 +3284,67 @@ impl HistoricalSwapLoader {
     /// Get token decimals from database for backtest mode
     pub async fn get_token_decimals_batch(
         &self,
+        chain_name: &str,
         tokens: &[Address],
         block_number: u64,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> anyhow::Result<Vec<u8>> {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
 
         let conn = self.db_pool.get().await
-            .map_err(|e| format!("Failed to get database connection: {}", e))?;
+            .map_err(|e| anyhow!("Failed to get database connection: {}", e))?;
         
         // Convert tokens to bytes for the query
         let token_bytes: Vec<&[u8]> = tokens.iter().map(|t| t.as_bytes()).collect();
-        
+        let aliases = self.chain_aliases(chain_name);
+
+        // Get configurable lookback from chain config (reuse price_lookback_blocks or default to 10000)
+        let lookback: i64 = self.chain_config.chains.get(&self.normalize_network_id(chain_name))
+            .and_then(|c| c.price_lookback_blocks)
+            .map(|v| v as i64)
+            .unwrap_or(10000);
+
         // Single efficient query to get decimals for all tokens
         let query = r#"
             WITH token_decimals AS (
-                SELECT DISTINCT ON (token_address) 
+                SELECT DISTINCT ON (token_address)
                     token_address,
                     decimals,
                     block_number
                 FROM (
-                    SELECT 
+                    SELECT
                         token0_address as token_address,
                         token0_decimals as decimals,
                         block_number
                     FROM swaps
-                    WHERE token0_address = ANY($1)
+                    WHERE token0_address = ANY($1::bytea[])
                         AND block_number <= $2
-                        AND block_number > ($2 - 1000)
+                        AND block_number > ($2 - $4)
                         AND token0_decimals IS NOT NULL
+                        AND LOWER(network_id) = ANY($3::text[])
                     UNION ALL
-                    SELECT 
+                    SELECT
                         token1_address as token_address,
                         token1_decimals as decimals,
                         block_number
                     FROM swaps
-                    WHERE token1_address = ANY($1)
+                    WHERE token1_address = ANY($1::bytea[])
                         AND block_number <= $2
-                        AND block_number > ($2 - 1000)
+                        AND block_number > ($2 - $4)
                         AND token1_decimals IS NOT NULL
+                        AND LOWER(network_id) = ANY($3::text[])
                 ) combined
                 ORDER BY token_address, block_number DESC
             )
             SELECT token_address, decimals
             FROM token_decimals
         "#;
-        
+
         let rows = conn
-            .query(query, &[&token_bytes, &(block_number as i64)])
+            .query(query, &[&token_bytes, &(block_number as i64), &aliases, &lookback])
             .await
-            .map_err(|e| format!("Database error: {}", e))?;
+            .map_err(|e| anyhow!("Database error: {}", e))?;
         
         // Create a map of token address to decimals
         let mut decimals_map = HashMap::new();
@@ -3269,33 +3388,31 @@ impl HistoricalSwapLoader {
             .map_err(|e| anyhow!("Failed to get database connection: {}", e))?;
         
         let pool_bytes = pool_address.as_bytes();
-        let chain_string = chain_name.map(|c| c.to_string());
-        
-        let (query, params) = if let Some(_chain) = chain_name {
+
+        let row_opt = if let Some(chain) = chain_name {
             let query = r#"
                 SELECT MIN(block_number) as earliest_block
                 FROM swaps
-                WHERE pool_address = $1 
-                    AND LOWER(network_id) = $2
+                WHERE pool_address = $1
+                    AND LOWER(network_id) = ANY($2::text[])
                     AND token0_address IS NOT NULL
                     AND token1_address IS NOT NULL
             "#;
-            let params = vec![&pool_bytes as &(dyn tokio_postgres::types::ToSql + Sync), chain_string.as_ref().unwrap()];
-            (query, params)
+            let aliases = self.chain_aliases(chain);
+            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&pool_bytes, &aliases];
+            conn.query_opt(query, &params).await
         } else {
             let query = r#"
                 SELECT MIN(block_number) as earliest_block
                 FROM swaps
-                WHERE pool_address = $1 
+                WHERE pool_address = $1
                     AND token0_address IS NOT NULL
                     AND token1_address IS NOT NULL
             "#;
-            let params = vec![&pool_bytes as &(dyn tokio_postgres::types::ToSql + Sync)];
-            (query, params)
-        };
-        
-        let row_opt = conn.query_opt(query, &params[..]).await
-            .map_err(|e| anyhow!("Database query failed for earliest block: {}", e))?;
+            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&pool_bytes];
+            conn.query_opt(query, &params).await
+        }
+        .map_err(|e| anyhow!("Database query failed for earliest block: {}", e))?;
         
         if let Some(row) = row_opt {
             let earliest_block: Option<i64> = row.get("earliest_block");
@@ -3319,9 +3436,8 @@ impl HistoricalSwapLoader {
         
         let pool_bytes = pool_address.as_bytes();
         let block_number_i64 = block_number as i64;
-        let chain_string = chain_name.map(|c| c.to_string());
         
-        let (query, params) = if let Some(_chain) = chain_name {
+        let row_opt = if let Some(chain) = chain_name {
             let query = r#"
                 SELECT 
                     pool_address,
@@ -3356,15 +3472,22 @@ impl HistoricalSwapLoader {
                     v3_amount1
                 FROM swaps
                 WHERE pool_address = $1 
-                    AND network_id = $2
+                    AND LOWER(network_id) = ANY($2::text[])
                     AND block_number <= $3
                     AND token0_address IS NOT NULL
                     AND token1_address IS NOT NULL
                 ORDER BY block_number DESC, log_index DESC
                 LIMIT 1
             "#;
-            let params = vec![&pool_bytes as &(dyn tokio_postgres::types::ToSql + Sync), chain_string.as_ref().unwrap(), &block_number_i64];
-            (query, params)
+            let aliases = self.chain_aliases(chain);
+            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 3] = [
+                &pool_bytes as &(dyn tokio_postgres::types::ToSql + Sync),
+                &aliases as &(dyn tokio_postgres::types::ToSql + Sync),
+                &block_number_i64 as &(dyn tokio_postgres::types::ToSql + Sync),
+            ];
+            conn.query_opt(query, &params)
+            .await
+            .map_err(|e| anyhow!("Database query failed for latest state: {}", e))?
         } else {
             let query = r#"
                 SELECT 
@@ -3406,12 +3529,14 @@ impl HistoricalSwapLoader {
                 ORDER BY block_number DESC, log_index DESC
                 LIMIT 1
             "#;
-            let params = vec![&pool_bytes as &(dyn tokio_postgres::types::ToSql + Sync), &block_number_i64];
-            (query, params)
+            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [
+                &pool_bytes as &(dyn tokio_postgres::types::ToSql + Sync),
+                &block_number_i64 as &(dyn tokio_postgres::types::ToSql + Sync),
+            ];
+            conn.query_opt(query, &params)
+            .await
+            .map_err(|e| anyhow!("Database query failed for latest state: {}", e))?
         };
-        
-        let row_opt = conn.query_opt(query, &params[..]).await
-            .map_err(|e| anyhow!("Database query failed for latest state: {}", e))?;
         
         if let Some(row) = row_opt {
             match self.parse_pool_state_from_row(&row) {
@@ -3496,7 +3621,7 @@ impl HistoricalSwapLoader {
             }
         };
 
-        let normalized_chain = self.normalize_network_id(chain_name);
+        let aliases = self.chain_aliases(chain_name);
 
         // Query for WETH-stablecoin swap pairs within the block range
         let query = r#"
@@ -3505,7 +3630,7 @@ impl HistoricalSwapLoader {
                 token0_address, token1_address, token0_decimals, token1_decimals,
                 block_number, unix_ts
             FROM swaps
-            WHERE LOWER(network_id) = $1
+            WHERE LOWER(network_id) = ANY($1::text[])
               AND block_number >= $2
               AND block_number <= $3
               AND ((token0_address = $4 AND token1_address = $5) OR (token0_address = $5 AND token1_address = $4))
@@ -3515,7 +3640,7 @@ impl HistoricalSwapLoader {
         "#;
 
         let rows = match conn.query(query, &[
-            &normalized_chain,
+            &aliases,
             &(start_block as i64),
             &(end_block as i64),
             &weth_address.as_bytes(),
@@ -3544,87 +3669,39 @@ impl HistoricalSwapLoader {
             let token0_addr = Address::from_slice(&token0);
             let token1_addr = Address::from_slice(&token1);
 
-            // Parse decimal values safely and convert to proper units
-            let _amount0_in: Option<f64> = match row.get::<_, Option<Decimal>>("amount0_in") {
-                Some(d) => {
-                    let raw_amount = d.to_f64().unwrap_or(0.0);
-                    if raw_amount > 0.0 {
-                        Some(raw_amount / 10_f64.powi(token0_decimals))
-                    } else {
-                        None
-                    }
-                },
-                None => None,
-            };
-
-            let amount0_out: Option<f64> = match row.get::<_, Option<Decimal>>("amount0_out") {
-                Some(d) => {
-                    let raw_amount = d.to_f64().unwrap_or(0.0);
-                    if raw_amount > 0.0 {
-                        Some(raw_amount / 10_f64.powi(token0_decimals))
-                    } else {
-                        None
-                    }
-                },
-                None => None,
-            };
-
-            let amount1_in: Option<f64> = match row.get::<_, Option<Decimal>>("amount1_in") {
-                Some(d) => {
-                    let raw_amount = d.to_f64().unwrap_or(0.0);
-                    if raw_amount > 0.0 {
-                        Some(raw_amount / 10_f64.powi(token1_decimals))
-                    } else {
-                        None
-                    }
-                },
-                None => None,
-            };
-
-            let _amount1_out: Option<f64> = match row.get::<_, Option<Decimal>>("amount1_out") {
-                Some(d) => {
-                    let raw_amount = d.to_f64().unwrap_or(0.0);
-                    if raw_amount > 0.0 {
-                        Some(raw_amount / 10_f64.powi(token1_decimals))
-                    } else {
-                        None
-                    }
-                },
-                None => None,
-            };
+            // Parse decimal values safely and convert using Decimal scaling
+            let amount0_out_dec: Option<Decimal> = row.get::<_, Option<Decimal>>("amount0_out");
+            let amount1_in_dec: Option<Decimal> = row.get::<_, Option<Decimal>>("amount1_in");
 
             let unix_ts: i64 = row.get("unix_ts");
             let _block_number: i64 = row.get("block_number");
 
             // Calculate price based on swap direction
-            let price = if token0_addr == weth_address && token1_addr == stablecoin_address {
-                // WETH -> stablecoin: WETH amount out / stablecoin amount in
-                if let (Some(weth_out), Some(stable_in)) = (amount0_out, amount1_in) {
-                    if stable_in > 0.0 {
-                        stable_in / weth_out
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
+            let price_opt: Option<Decimal> = if token0_addr == weth_address && token1_addr == stablecoin_address {
+                if let (Some(weth_out_d), Some(stable_in_d)) = (amount0_out_dec, amount1_in_dec) {
+                    // Normalize by decimals using Decimal scaling
+                    let scale0 = self.decimal_pow10(token0_decimals as u32);
+                    let scale1 = self.decimal_pow10(token1_decimals as u32);
+                    let weth_out = weth_out_d / scale0;
+                    let stable_in = stable_in_d / scale1;
+                    if weth_out > Decimal::ZERO { Some(stable_in / weth_out) } else { None }
+                } else { None }
             } else if token0_addr == stablecoin_address && token1_addr == weth_address {
-                // stablecoin -> WETH: stablecoin amount out / WETH amount in
-                if let (Some(stable_out), Some(weth_in)) = (amount0_out, amount1_in) {
-                    if weth_in > 0.0 {
-                        stable_out / weth_in
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            } else {
-                continue;
-            };
+                if let (Some(stable_out_d), Some(weth_in_d)) = (amount0_out_dec, amount1_in_dec) {
+                    let scale0 = self.decimal_pow10(token0_decimals as u32);
+                    let scale1 = self.decimal_pow10(token1_decimals as u32);
+                    let stable_out = stable_out_d / scale0;
+                    let weth_in = weth_in_d / scale1;
+                    if weth_in > Decimal::ZERO { Some(stable_out / weth_in) } else { None }
+                } else { None }
+            } else { None };
 
-            if price.is_finite() && price > 0.0 {
-                prices.push((price, unix_ts as u64));
+            if let Some(price_dec) = price_opt {
+                if let Some(price_f64) = price_dec.to_f64() {
+                    if price_f64.is_finite() && price_f64 > 0.0 {
+                        prices.push((price_f64, unix_ts as u64));
+                    }
+                }
             }
         }
 
@@ -3662,21 +3739,26 @@ impl HistoricalSwapLoader {
         block_number: u64,
     ) -> Result<Option<f64>> {
         let conn = self.db_pool.get().await?;
-        let network_id = self.normalize_network_id(chain_name);
-        let lookback_blocks: i64 = 1000; // Configurable lookback for finding pair prices
+        let aliases = self.chain_aliases(chain_name);
+        let lookback_blocks: i64 = self.chain_config
+            .chains
+            .get(&self.normalize_network_id(chain_name))
+            .and_then(|c| c.price_lookback_blocks)
+            .map(|v| v as i64)
+            .unwrap_or(1000);
 
         // Query for the most recent swap between token_a and token_b
         let query = r#"
             SELECT token0_address, price_t0_in_t1, price_t1_in_t0
             FROM swaps
-            WHERE LOWER(network_id) = $1
+            WHERE LOWER(network_id) = ANY($1::text[])
                 AND block_number <= $2 AND block_number > ($2 - $3)
                 AND ((token0_address = $4 AND token1_address = $5) OR (token0_address = $5 AND token1_address = $4))
             ORDER BY block_number DESC, log_index DESC
             LIMIT 1
         "#;
 
-        if let Ok(Some(row)) = conn.query_opt(query, &[&network_id, &(block_number as i64), &lookback_blocks, &token_a.as_bytes(), &token_b.as_bytes()]).await {
+        if let Ok(Some(row)) = conn.query_opt(query, &[&aliases, &(block_number as i64), &lookback_blocks, &token_a.as_bytes(), &token_b.as_bytes()]).await {
             let token0_db: Vec<u8> = row.get("token0_address");
             let price0: Option<rust_decimal::Decimal> = row.get("price_t0_in_t1");
             let price1: Option<rust_decimal::Decimal> = row.get("price_t1_in_t0");

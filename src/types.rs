@@ -806,6 +806,11 @@ pub struct SwapEvent {
     pub v3_amount0: Option<I256>,
     pub v3_amount1: Option<I256>,
     pub v3_tick_data: Option<String>, // JSON serialized V3TickData
+    pub price_from_in_usd: Option<Decimal>,
+    pub price_to_in_usd: Option<Decimal>,
+    pub token0_price_usd: Option<Decimal>,
+    pub token1_price_usd: Option<Decimal>,
+    pub pool_liquidity_usd: Option<Decimal>,
 }
 
 //================================================================================================//
@@ -1698,6 +1703,11 @@ impl ArbitrageEngineTrait for ArbitrageEngine {
                 v3_amount0: None, // Not available in DexSwapEvent
                 v3_amount1: None, // Not available in DexSwapEvent
                 v3_tick_data: None, // Not available in DexSwapEvent
+                price_from_in_usd: None,
+                price_to_in_usd: None,
+                token0_price_usd: None,
+                token1_price_usd: None,
+                pool_liquidity_usd: None,
             }
         }).collect();
 
